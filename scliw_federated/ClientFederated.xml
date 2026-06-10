@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<executable>
+  <category>HistomicsTK</category>
+  <title>Client Federation</title>
+  <description>Run the client task for a federated process</description>
+  <version>1.0.0</version>
+  <documentation-url>https://digitalslidearchive.github.io/HistomicsTK</documentation-url>
+  <license>Apache 2.0</license>
+  <contributor>David Manthey (Kitware Inc)</contributor>
+  <acknowledgements>This work is part of the HistomicsTK project.</acknowledgements>
+  <parameters>
+    <label>Inputs</label>
+    <description>Input parameters</description>
+    <string>
+      <name>clientid</name>
+      <longflag>client-id</longflag>
+      <label>Client ID</label>
+      <description>Client identifier</description>
+      <default>Client A</default>
+    </string>
+    <string>
+      <name>workpath</name>
+      <longflag>work-path</longflag>
+      <label>Work Path</label>
+      <description>Hub Girder path to work folder</description>
+      <default>/collection/Federated/Task</default>
+    </string>
+    <string>
+      <name>datapath</name>
+      <longflag>data-path</longflag>
+      <label>Data Path</label>
+      <description>Local Girder path to csv data item</description>
+      <default>/collection/Federated/data/data.csv</default>
+    </string>
+    <string>
+      <name>hubApiUrl</name>
+      <longflag>hub-url</longflag>
+      <label>Hub Girder API URL</label>
+      <description>A Girder API URL (e.g., https://girder.example.com:443/api/v1)</description>
+      <default></default>
+    </string>
+    <string>
+      <name>hubtoken</name>
+      <longflag>hub-token</longflag>
+      <label>Hub Girder Token</label>
+      <description>A Girder token</description>
+      <default></default>
+    </string>
+  </parameters>
+  <!-- These are used to allow sending annotations directly to girder -->
+  <parameters advanced="true">
+    <label>Girder API URL and Key</label>
+    <description>A Girder API URL and token for Girder client</description>
+    <string>
+      <name>girderApiUrl</name>
+      <longflag>girder-url</longflag>
+      <label>Girder API URL</label>
+      <description>A Girder API URL (e.g., https://girder.example.com:443/api/v1)</description>
+      <default></default>
+    </string>
+    <string>
+      <name>girderToken</name>
+      <longflag>girder-token</longflag>
+      <label>Girder Token</label>
+      <description>A Girder token</description>
+      <default></default>
+    </string>
+  </parameters>
+</executable>

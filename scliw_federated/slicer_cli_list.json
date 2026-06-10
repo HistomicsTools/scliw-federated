@@ -1,0 +1,8 @@
+{
+  "HubFederated": {
+    "type": "python"
+  },
+  "ClientFederated": {
+    "type": "python"
+  }
+}
