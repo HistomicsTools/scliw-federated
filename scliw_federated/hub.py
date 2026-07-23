@@ -108,8 +108,10 @@ class HubCoordinator:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1')
-    parser.add_argument('--girder-token', required=True)
+    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1',
+                        help='Local Girder URL')
+    parser.add_argument('--girder-token', required=True,
+                        help='Local Girder authentication token')
     parser.add_argument('--work-path', required=True,
                         help='Hub Girder path to work folder')
     parser.add_argument('--epochs', type=int, default=3,
