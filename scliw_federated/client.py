@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = '>=3.10'
+# requires-python = ">=3.10"
 # dependencies = [
-#     'girder-client',
-#     'torch',
-#     'pandas',
-#     'scikit-learn',
+#     "girder-client==2.4.0",
+#     "torch>=2.0.0",
+#     "pandas>=2.0.0",
+#     "scikit-learn>=1.3.0",
+#     "nvflare>=2.6.0",
 # ]
 # ///
 
@@ -14,26 +15,22 @@ import os
 import sys
 import tempfile
 import time
+from typing import Dict, Optional
 
 import girder_client
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 
-
-class CardioDataset(torch.utils.data.Dataset):
-    """Lightweight PyTorch Dataset for Cardio Neural Networks."""
-
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.long)
-
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+try:
+    from .nvflare_bus import GirderEventBus
+except Exception:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    from nvflare_bus import GirderEventBus
 
 
 class CardioNN(nn.Module):
@@ -53,184 +50,136 @@ class CardioNN(nn.Module):
         return self.fc3(self.relu(self.fc2(self.relu(self.fc1(x)))))
 
 
-class FederatedCardioClient:
+class FedClientWorker:
     """
-    Client-side federated learning worker.
-    Downloads global models from the Hub Girder workspace, trains strictly on
-    private locally-isolated data, and uploads updated weights back.
-    Communicates with Hub via identical polling-item-queue mechanism as scliw_federated.
-
-    INSTRUCTIONS FOR USERS:
-    - You must provide a partitioned CSV file containing your local private data.
-    - The --data-path argument can point to a mounted Docker volume path
-      (e.g., /mnt/data/train.csv) OR a local Girder item path.
+    A Federated Learning client strictly bound to local CSV data and
+    synchronized over Girder via our custom Event Bus.
     """
 
-    def __init__(
-        self, client_id, girder_url, girder_token, hub_url, hub_token,
-        data_path, work_path,
-    ):
+    def __init__(self, client_id: str, hub_url: str, hub_token: str, workspace_path: str, data_path: str,
+                 local_girder_url: str = None, local_girder_token: str = None):
         self.client_id = client_id
+        print(f"[CLIENT] Initializing worker {client_id} connected to Hub Girder.")
 
-        # Connect to local Girder (where private training data lives)
-        self.gc_local = girder_client.GirderClient(apiUrl=girder_url)
-        self.gc_local.token = girder_token
-
-        # Connect to Hub Girder for coordination and model transport
-        self.gc_hub = girder_client.GirderClient(apiUrl=hub_url)
-        self.gc_hub.token = hub_token
-
-        # Resolve the Hub workspace folder (used for polls, download/push updates)
-        resp = self.gc_hub.get('resource/lookup', parameters={'path': work_path})
-        if not resp:
-            raise FileNotFoundError(f"Central Hub workspace '{work_path}' not found in Girder.")
-
-        self.workspace_folder_id = resp['_id']
+        # Initialize our Girder-based event bus for communication
+        self.bus = GirderEventBus(hub_url, hub_token, workspace_path)
         self.data_path = data_path
-        self.local_model_path = None
         self.epoch = 0
 
-    def download_global_model(self, target_epoch):
-        """Checks Hub workspace for the exact global model file uploaded for this round."""
-        items = list(self.gc_hub.listItem(self.workspace_folder_id))
-        filename_needed = f'global_model_epoch_{target_epoch}.pt'
+        # Store credentials for potential local Girder access on the spoke (client) side
+        self.local_girder_url = local_girder_url
+        self.local_girder_token = local_girder_token
+        self.gc_local = None
+        if self.local_girder_url:
+            self.gc_local = girder_client.GirderClient(apiUrl=self.local_girder_url)
+            if self.local_girder_token:
+                self.gc_local.token = self.local_girder_token
 
-        for item in items:
-            if item['name'] == filename_needed:
-                files = list(self.gc_hub.listFile(item['_id'], limit=1))
-                if files:
-                    target_tmp = os.path.join(tempfile.gettempdir(), f'global_{target_epoch}.pt')
-                    self.gc_hub.downloadFile(files[0]['_id'], target_tmp)
-                    return torch.load(target_tmp, map_location='cpu')
-        raise TimeoutError(
-            f'{target_epoch} global model epoch was not found in Hub workspace.')
+    def load_model(self, global_weights: Dict[str, torch.Tensor]) -> nn.Module:
+        model = CardioNN(input_size=next(iter(global_weights.values())).shape[1])
+        if global_weights:
+            model.load_state_dict(global_weights)
+        return model
 
-    def upload_local_update(self, state_dict):
-        path = os.path.join(
-            tempfile.gettempdir(), f'weights_epoch_{self.epoch}_{self.client_id}.pt')
-        torch.save(state_dict, path)
-
-        self.gc_hub.uploadFileToFolder(
-            self.workspace_folder_id,
-            path,
-            os.path.basename(path)
+    def train_epoch(self, model: nn.Module, local_X: np.ndarray, local_y: np.ndarray) -> Optional[Dict]:
+        """Executes localized training and returns the updated state dict."""
+        train_loader = torch.utils.data.DataLoader(
+            list(zip(local_X, local_y)), batch_size=32, shuffle=True
         )
 
-    def wait_for_trigger(self):
-        """Polls Hub workspace for trigger items using the scliw_federated polling pattern."""
-        while True:
-            try:
-                items = list(self.gc_hub.listItem(self.workspace_folder_id))
-
-                # Check if we should stop training based on Hub signal
-                if any('trigger_done' in item['name'] for item in items):
-                    print("[CLIENT] Received 'trigger_done' signal. Shutting down worker.")
-                    sys.exit(0)
-
-                for item in items:
-                    if f'trigger_{self.epoch}' in item['name']:
-                        print(f'[CLIENT] Trigger found for epoch {self.epoch}.')
-                        return
-
-                time.sleep(5.0)
-            except Exception as e:
-                print(f'[CLIENT] Connection error checking trigger (will retry): {e}')
-                time.sleep(5.0)
-
-    def load_data(self):
-        """
-        Loads data from local filesystem or local Girder
-        """
-        if os.path.exists(self.data_path):
-            return pd.read_csv(self.data_path, sep=';')
-        local_item = self.gc_local.get(
-            'resource/lookup', parameters={'path': self.data_path})
-        if local_item:
-            files = list(self.gc_local.listFile(local_item['_id'], limit=1))
-            if files:
-                tmp_data = os.path.join(tempfile.gettempdir(), 'local_client_data.csv')
-                self.gc_local.downloadFile(files[0]['_id'], tmp_data)
-                return pd.read_csv(tmp_data, sep=';')
-
-        raise FileNotFoundError(f'Could not find data at {self.data_path}.')
-
-    def run_training_round(self, global_weights):
-        df = self.load_data()
-        y = None
-        X = None
-        # Automatically detect target column and features (expecting 'cardio' as label)
-        if 'cardio' in df.columns:
-            y = df['cardio'].values.astype(int)
-            X = df.drop(columns=['cardio']).values
-        else:
-            # Fallback if the user's partition does not have a 'cardio' label column
-            y = df.iloc[:, -1].values.astype(int)
-            X = df.iloc[:, :-1].values
-        X_scaled = StandardScaler().fit_transform(X)
-        local_X, local_y = X_scaled, y
-        device = torch.device('cpu')
-        train_loader = torch.utils.data.DataLoader(CardioDataset(
-            local_X, local_y), batch_size=32, shuffle=True)
-        model = CardioNN(input_size=local_X.shape[1]).to(device)
-        model.load_state_dict(global_weights)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-        model.train()
-        for _epoch in range(3):
-            for X_batch, y_batch in train_loader:
-                X_batch = X_batch.to(device)
-                y_batch = y_batch.to(device)
+
+        for _ in range(3): # Fixed internal epochs per federated round
+            model.train()
+            for batch_X, batch_y in train_loader:
+                X_batch = torch.tensor(batch_X[0], dtype=torch.float32)
+                y_batch = torch.tensor(batch_y[1], dtype=torch.long)
+
                 optimizer.zero_grad()
                 loss = criterion(model(X_batch), y_batch)
                 loss.backward()
                 optimizer.step()
-        state_dict = model.state_dict()
-        self.upload_local_update(state_dict)
-        # Signal completion
-        self.gc_hub.createItem(
-            parentFolderId=self.workspace_folder_id,
-            name=f'completed_{self.epoch}_{self.client_id}',
-            metadata={'status': 'done'}
-        )
+
+        return model.state_dict()
 
     def run(self):
-        """Main client execution loop."""
-        print(f'[CLIENT] Initializing Worker ID {self.client_id} connected to Hub Girder.')
-
+        """Main client execution loop. Uses our Girder Bus for orchestration."""
         while True:
-            # Wait for the next round to begin on the Hub side
-            self.wait_for_trigger()
-            # Download epoch global model from Hub workspace
-            global_weights = self.download_global_model(self.epoch)
-            # Train strictly on local data
-            self.run_training_round(global_weights)
-            print(f'[CLIENT] Finished round {self.epoch}. Waiting for next Hub trigger...')
-            self.epoch += 1
+            try:
+                task = self.bus.subscribe_item("global_model_epoch")
+                if task['status'] == 'shutdown':
+                    print("[CLIENT] Received shutdown signal from Hub.")
+                    sys.exit(0)
+
+                expected_epoch = task['epoch']
+                print(f"[CLIENT] Epoch {expected_epoch} triggered. Downloading global model...")
+
+                # Fetch the weights (The Hub pushes them via our bus logic)
+                new_weights = self.bus.fetch_model(client_id='hub', expected_epoch=expected_epoch)
+                if not new_weights:
+                    raise ValueError("No global weights found in bus.")
+
+                # Inject data from local CSV into the NVFlare-compatible model layer
+                if os.path.exists(self.data_path):
+                    df = pd.read_csv(self.data_path, sep=';')
+                elif self.gc_local:
+                    # Attempt to fetch via the client's local Girder instance if not a local file
+                    try:
+                        item = self.gc_local.get('resource/lookup', parameters={'path': self.data_path})
+                        files = list(self.gc_local.listFile(item['_id'], limit=1))
+                        tmp_data = os.path.join(tempfile.gettempdir(), 'local_client_data.csv')
+                        self.gc_local.downloadFile(files[0]['_id'], tmp_data)
+                        df = pd.read_csv(tmp_data, sep=';')
+                    except Exception as e:
+                        raise FileNotFoundError(f"Failed to fetch data '{self.data_path}' from local Girder: {e}")
+                else:
+                    raise FileNotFoundError(f"Data '{self.data_path}' not found locally and no local Girder credentials provided.")
+
+                y = df['cardio'].values.astype(int)
+                X = StandardScaler().fit_transform(df.drop(columns=['cardio']).values)
+
+                # Train locally
+                state_dict = self.train_epoch(self.load_model(new_weights), X, y)
+
+                if not state_dict:
+                    raise ValueError("Training failed or returned empty state dict.")
+
+                # "Send" the update back to the Hub via our bus
+                print(f"[CLIENT] Uploading local weights for epoch {expected_epoch + 1}...")
+                self.bus.publish_model(
+                    name=f'weights_epoch_{expected_epoch + 1}',
+                    state_dict=state_dict,
+                    client_id=self.client_id
+                )
+
+                # Prepare for the next round
+                self.epoch += 1
+
+            except TimeoutError:
+                print("[CLIENT] Waiting Hub Trigger...")
+                time.sleep(5.0)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--client-id', required=True, help='Client identifier')
-    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1',
-                        help='Local Girder URL')
-    parser.add_argument('--girder-token', required=True,
-                        help='Local Girder authentication token')
-    parser.add_argument('--hub-url', default='http://hub.example.com/api/v1',
-                        help='Hub Girder URL')
-    parser.add_argument('--hub-token', required=True,
-                        help='Hub authentication token')
-    parser.add_argument('--data-path', required=True,
-                        help='Local Girder path to csv data item')
-    parser.add_argument('--work-path', required=True,
-                        help='Hub Girder path to work folder')
+    parser = argparse.ArgumentParser(description="NVFlare-enabled Federated Client Worker")
+    parser.add_argument('--client-id', required=True, help="Worker ID string")
+    parser.add_argument('--hub-url', default='http://hub.girder.com/api/v1')
+    parser.add_argument('--hub-token', required=True)
+    parser.add_argument('--workspace', required=True, help="Shared Hub Girder Folder path")
+    # Added back the local Girder options for fetching private data on isolated spokes
+    parser.add_argument('--local-girder-url', default=None, help="Local Girder URL on the spoke node for data access")
+    parser.add_argument('--local-girder-token', default=None, help="Auth token for the local Girder instance")
+    parser.add_argument('--data-path', required=True, help="Local CSV or local Girder Item path within container")
+
     args = parser.parse_args()
-    worker = FederatedCardioClient(
+
+    FedClientWorker(
         client_id=args.client_id,
-        girder_url=args.girder_url,
-        girder_token=args.girder_token,
         hub_url=args.hub_url,
         hub_token=args.hub_token,
+        workspace_path=args.workspace,
         data_path=args.data_path,
-        work_path=args.work_path,
-    )
-    worker.run()
+        local_girder_url=args.local_girder_url,
+        local_girder_token=args.local_girder_token
+    ).run()

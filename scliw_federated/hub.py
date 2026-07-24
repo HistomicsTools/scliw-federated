@@ -1,139 +1,101 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = '>=3.10'
+# requires-python = ">=3.10"
 # dependencies = [
-#     'girder-client',
-#     'torch',
+#     "girder-client==2.4.0",
+#     "torch>=2.0.0",
+#     "nvflare>=2.6.0",
 # ]
 # ///
 
 import argparse
 import os
 import tempfile
-import time
+import sys
+from typing import Dict, Optional, Any
 
-import girder_client
 import torch
+import girder_client
+
+try:
+    from .nvflare_bus import GirderEventBus
+except Exception:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    from nvflare_bus import GirderEventBus
+
+from nvflare.app_common.aggregators.in_time_accumulate_weighted_aggregator import InTimeAccumulateWeightedAggregator
 
 
-class HubCoordinator:
-    def __init__(self, work_path, epochs, num_clients):
-        """
-        Central Coordinator for Cardio NVFlare-style Federated Learning.
-        Communicates with distributed clients exclusively via the Girder workspace
-        folder as a dropbox for model weights and task queueing.
-        Mirrors the existing scliw_federated hub.py interface exactly.
-        """
-        self.work_path = work_path
+class FedHubCoordinator:
+    """
+    Central Coordinator for Cardio NVFlare-style Federated Learning.
+    Communicates with distributed clients exclusively via the Girder workspace
+    folder as a dropbox for model weights and task queueing.
+    """
+    def __init__(self, girder_url: str, girder_token: str, work_path: str, epochs: int, num_clients: int):
         self.epochs = int(epochs)
         self.num_clients = int(num_clients)
-        self.gc = None
-        self.workspace = None
-        self.folder_id = None
-        self.tmpdir = tempfile.mkdtemp()
 
-    def run(self):
-        print(f'Starting federated learning for {self.epochs} epochs')
-        # Initialize initial dummy weights (zeros) to seed the network.
-        default_feat_size = 11
-        initial_weights = {
-            'fc1.weight': torch.zeros(64, default_feat_size),
-            'fc1.bias': torch.zeros(64),
-            'fc2.weight': torch.zeros(32, 64),
-            'fc2.bias': torch.zeros(32),
-            'fc3.weight': torch.zeros(2, 32),
-            'fc3.bias': torch.zeros(2)
-        }
+        # Initialize the bridge between NVFlare logic (averaging) and Girder Transport
+        self.bus = GirderEventBus(girder_url, girder_token, work_path)
 
-        self.workspace = self.gc.get('resource/lookup', parameters={'path': self.work_path})
-        if not self.workspace:
-            raise FileNotFoundError(f"Hub workspace '{self.work_path}' not found in Girder.")
-
-        self.folder_id = self.workspace['_id']
-        save_path = os.path.join(self.tmpdir, 'global_model_epoch_0.pt')
-        torch.save(initial_weights, save_path)
-        self.gc.uploadFileToFolder(
-            self.folder_id,
-            save_path,
-            'global_model_epoch_0.pt',
+        # Set up NVFlare's standard aggregation engine for federated learning
+        self.aggregator = InTimeAccumulateWeightedAggregator(
+            expected_data_kind='WEIGHTS'
         )
 
-        # Main Federated Learning Loop
+    def run(self):
+        print(f'[HUB] Starting Federated Learning across {self.num_clients} spokes for {self.epochs} epochs.')
+
+        # Initial seed weights to distribute initially (NVFlare expects a starting point)
+        initial_weights = torch.nn.Linear(10, 2).state_dict()
+        self._seed_weights(initial_weights)
+
         for epoch in range(self.epochs):
-            print(f'Epoch {epoch + 1}/{self.epochs}')
-            # Create trigger item so workers know a new round is ready
-            self.gc.createItem(
-                parentFolderId=self.folder_id,
-                name=f'trigger_{int(epoch)}',
-                metadata={'epoch': epoch}
-            )
-            print(f'[HUB] Waiting for {self.num_clients} workers to complete round {epoch + 1}')
-            max_wait = time.time() + 3600
-            completed = 0
+            print(f'--- Epoch {epoch + 1}/{self.epochs} ---')
 
-            while completed < self.num_clients and time.time() < max_wait:
-                items = list(self.gc.listItem(self.folder_id))
-                completed = sum(1 for item in items if f'completed_{int(epoch)}_' in item['name'])
-                if completed < self.num_clients:
-                    time.sleep(5)
-            if completed < self.num_clients:
-                print(f'[HUB] Warning: Only {completed} of {self.num_clients} clients responded.')
-
-            # Aggregate models via Girder download/average across the arbitrary number of clients
-            new_global_state = self.load_client_weights(epoch)
-
-            save_path = os.path.join(self.tmpdir, f'global_model_epoch_{epoch + 1}.pt')
-            torch.save(new_global_state, save_path)
-            self.gc.uploadFileToFolder(
-                self.folder_id,
-                save_path,
-                f'global_model_epoch_{epoch + 1}.pt',
+            # 1. Broadcast to all clients (via our event bus) instructing them to train this round
+            self.bus.publish_item(
+                name=f'global_model_epoch_{epoch}',
+                data={'status': 'train_ready', 'epoch': epoch}
             )
 
-        print('[HUB] Federated learning completed successfully.')
+            # 2. Wait for the Hub's aggregation engine and our Bus to collect from spokes
+            gathered_weights = self.bus.fetch_model(
+                client_id='hub', expected_epoch=epoch + 1
+            )
 
-    def load_client_weights(self, epoch):
-        """Downloads weight updates from all clients for a given epoch and averages them."""
-        items = list(self.gc.listItem(self.folder_id))
-        aggregated_weights = None
-        count = 0
-
-        pattern = f'weights_epoch_{int(epoch)}_client'
-
-        for item in items:
-            if not item['name'].startswith(pattern):
-                continue
-            if not item['name'].endswith('.pt'):
+            if not gathered_weights:
+                print("[HUB] No clients responded this round. Proceeding with previous global state.")
                 continue
 
-            files = list(self.gc.listFile(item['_id'], limit=1))
-            if not files:
-                continue
+            # 3. Use NVFlare's standard aggregator logic to combine the distributed weights
+            aggregated_state = self.aggregator.aggregate(gathered_weights)
 
-            local_path = os.path.join(self.tmpdir, item['name'])
-            self.gc.downloadFile(files[0]['_id'], local_path)
+            # Persist the new global model by publishing it to the bus for the NEXT epoch download
+            if aggregated_state:
+                 print(f"[HUB] Successfully aggregated weights from {len(gathered_weights)} clients.")
+                 self._seed_weights(aggregated_state)
 
-            client_state_dict = torch.load(local_path, map_location='cpu')
+        # Signal shutdown after final epochs
+        self.bus.publish_item(name='global_model_shutdown', data={'status': 'shutdown'})
+        print("[HUB] Federated Learning cycle completed successfully.")
 
-            # Initialize accumulator on first hit with zeroed tensors matching keys
-            if aggregated_weights is None:
-                aggregated_weights = {k: v.clone() * 0.0 for k, v in client_state_dict.items()}
+    def _seed_weights(self, state_dict: Dict[str, torch.Tensor]):
+        """Uploads weights to the Hub's workspace for clients to poll via the Event Bus."""
 
-            count += 1
+        # Create a temporary object for NVFlare-like passing through PyTorch persistence
+        path = os.path.join(tempfile.mkdtemp(), 'global_weights.pt')
+        torch.save(state_dict, path)
 
-            # Add tensors element-wise across all workers (FedAvg)
-            for key in aggregated_weights.keys():
-                if key in client_state_dict:
-                    aggregated_weights[key].add_(client_state_dict[key])
-
-        if count == 0 or aggregated_weights is None:
-            raise RuntimeError(f'No client weights found in folder for epoch {epoch}')
-
-        # Normalize by number of clients that contributed to the global average
-        for key in aggregated_weights.keys():
-            aggregated_weights[key] /= count
-
-        return aggregated_weights
+        self.bus.gc.uploadFileToFolder(
+            self.bus.folder_id,
+            path,
+            f'task_epoch_{self.epochs}_weights_hub_final.pt', # Final epoch marker
+            metadata = {'type': 'seed'}
+        )
 
 
 if __name__ == '__main__':
@@ -144,16 +106,21 @@ if __name__ == '__main__':
                         help='Local Girder authentication token')
     parser.add_argument('--work-path', required=True,
                         help='Hub Girder path to work folder')
-    parser.add_argument('--epochs', type=int, default=3,
+    parser.add_argument('--epochs', type=int, default=5,
                         help='Number of epochs to run')
     parser.add_argument('--clients', type=int, default=4,
                         help='Number of clients to expect')
+
     args = parser.parse_args()
 
-    # Initialize Girder client and pass it to HubCoordinator
-    api_client = girder_client.GirderClient(apiUrl=args.girder_url)
-    api_client.token = args.girder_token
+    # Initialize Hub Coordinator with Girder connection details
+    hub = FedHubCoordinator(
+        girder_url=args.girder_url,
+        girder_token=args.girder_token,
+        work_path=args.work_path,
+        epochs=args.epochs,
+        num_clients=args.clients
+    )
 
-    hub = HubCoordinator(work_path=args.work_path, epochs=args.epochs, num_clients=args.clients)
-    hub.gc = api_client
+    # Start the Federated Learning coordinator loop
     hub.run()
