@@ -17,31 +17,44 @@ from nvflare_bus import GirderDropbox
 
 
 class HubCoordinator:
-    def __init__(self, girder_url: str, work_path: str, epochs: int, num_clients: int, girder_token: str):
-        self.girder_url = girder_url
+    def __init__(self, girder_url: str, work_path: str, epochs: int, num_clients: int):
         self.work_path = work_path
         self.epochs = int(epochs)
         self.num_clients = int(num_clients)
-        self.token = girder_token
+        self.gc = None  # Placeholder, initialized in run
+        self.workspace = None
+        self.folder_id = None
+        self.dropbox = None
 
+    def _init_components(self, girder_token: str):
         import girder_client
+        
+        # Initialize Girder client
         self.gc = girder_client.GirderClient(apiUrl=self.girder_url)
-        self.gc.token = self.token
+        self.gc.token = girder_token
 
+        # Verify Hub Workspace
         self.workspace = self.gc.get('resource/lookup', parameters={'path': self.work_path})
         if not self.workspace:
             raise FileNotFoundError(f"Hub workspace '{self.work_path}' not found in Girder.")
+            
+        self.folder_id = self.workspace['_id']
 
-        # Initialize the NVFlare DropBox bridge
+        # Initialize the NVFlare DropBox bridge using explicit authentication (no env fallbacks)
         self.dropbox = GirderDropbox(
-            girder_url=girder_url,
+            girder_url=self.girder_url,
             girder_token=girder_token,
-            work_path=work_path
+            work_path=self.work_path
         )
 
-    def run(self):
-        print(f'[HUB] Starting federated training with {self.epochs} epochs and {self.num_clients} clients.')
+    def run(self, girder_token):
         import torch
+        
+        # Ensure components are initialized with the provided hub token
+        if not self.dropbox:
+            self._init_components(girder_token)
+            
+        print(f'[HUB] Starting federated training with {self.epochs} epochs and {self.num_clients} clients.')
 
         default_feat_size = 21 
         initial_weights = {
@@ -53,7 +66,6 @@ class HubCoordinator:
             'fc3.bias': torch.zeros(2)
         }
 
-        # Seed the first global model using DropBox
         self.dropbox.write_task(round_num=0, payload=initial_weights)
 
         for epoch in range(self.epochs):
@@ -61,7 +73,7 @@ class HubCoordinator:
             
             # Create trigger marker item
             self.gc.createItem(
-                parentFolderId=self.workspace['_id'], 
+                parentFolderId=self.folder_id, 
                 name=f'trigger_{int(epoch)}', 
                 metadata={'type': 'train'}
             )
@@ -89,7 +101,6 @@ class HubCoordinator:
         print('[HUB] Federated learning completed successfully.')
 
     def _load_client_weights(self, epoch):
-        """Downloads weight updates from all clients for a given epoch and averages them."""
         client_results = self.dropbox.read_all_results(epoch)
         
         if not client_results:
@@ -114,21 +125,29 @@ class HubCoordinator:
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Hub Coordinator for Cardio NVFlare")
-    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1', help='Hub Girder URL')
-    parser.add_argument('--work-path', required=True, help='Hub Girder path to work folder')
-    parser.add_argument('--epochs', type=int, default=5, help='Number of federated training rounds')
-    parser.add_argument('--clients', type=int, default=4, help='Number of distributed clients expected')
-    parser.add_argument('--girder-token', required=True, help='Hub Girder authentication token')
+    parser = argparse.ArgumentParser()
     
+    # Exactly matching the original scliw_federated arguments
+    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1',
+                        help='Hub Girder URL')
+    parser.add_argument('--girder-token', required=True,
+                        help='Hub Girder authentication token')
+    parser.add_argument('--work-path', required=True,
+                        help='Hub Girder path to work folder')
+    parser.add_argument('--epochs', type=int, default=3,
+                        help='Number of epochs to run')
+    parser.add_argument('--clients', type=int, default=4,
+                        help='Number of clients to expect')
+            
     args = parser.parse_args()
-
+    
+    # Initialize the Hub Coordinator with workspace resolution immediately to ensure path exists
     hub = HubCoordinator(
         girder_url=args.girder_url,
-        work_path=args.work_path,
+        work_path=args.work_path, 
         epochs=args.epochs,
-        num_clients=args.clients,
-        girder_token=args.girder_token
+        num_clients=args.clients
     )
-    
-    hub.run()
+    hub.girder_url = args.girder_url
+
+    hub.run(args.girder_token)

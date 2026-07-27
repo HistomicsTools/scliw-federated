@@ -21,7 +21,7 @@ import torch
 
 class CardioNN(torch.nn.Module):
     """3-layer Feed-forward Neural Network tailored for cardiovascular disease prediction."""
-    
+
     def __init__(self, input_size: int):
         super().__init__()
         self.fc1 = torch.nn.Linear(input_size, 64)
@@ -38,31 +38,38 @@ class FederatedCardioClient:
     Client-side federated learning worker using NVFlare logic + Girder Bus.
     Maintains strict data isolation while communicating via the DropBox mechanism.
     """
-    
-    def __init__(self, client_id, local_girder_url, hub_url, work_path, data_path):
-        self.client_id = int(client_id)
-        self.data_path = data_path
-        self.dropbox = None 
 
-    def _load_data(self):
+    def __init__(self, client_id: int, local_girder_url: str, local_token, hub_url: str, hub_token,
+                 work_path: str, data_path: str):
+        self.client_id = client_id
+        self.data_path = data_path
+
+        # Initialize connection to Hub Girder via the DropBox bridge
+        self.dropbox = GirderDropbox(
+            girder_url=hub_url,
+            girder_token=hub_token,
+            work_path=work_path
+        )
+
+    def _load_data(self, hub_token: str, local_girder_url: str):
         """Loads strict private data. Falls back to Girder download if filesystem path is not found."""
         import pandas as pd
         from sklearn.preprocessing import StandardScaler
-        
-        if os.path.exists(self.data_path):
-            print(f"[*] Loading data directly from mounted filesystem path: {self.data_path}")
-            df = pd.read_csv(self.data_path, sep=',')
+
+        # Priority 1: Direct filesystem access (Docker mount pattern)
+        if self.local_data_path and os.path.exists(self.local_data_path):
+            print(f"[*] Loading data directly from mounted filesystem: {self.local_data_path}")
+            df = pd.read_csv(self.local_data_path, sep=',')
         else:
-            local_gc = girder_client.GirderClient(apiUrl='http://localhost:8085/api/v1')
-            cred_file = os.environ.get('SCLIW_HUB_CRED_PATH')
-            if cred_file and os.path.exists(cred_file):
-                with open(cred_file) as f:
-                    local_gc.token = f.read().strip()
-                    
+            # Priority 2: Download from local Girder (Original scliw_federated pattern)
+            local_gc = girder_client.GirderClient(apiUrl=local_girder_url)
+            if self.local_token:
+                local_gc.token = self.local_token
+
             local_item = local_gc.get('resource/lookup', parameters={'path': self.data_path})
             if not local_item:
                 raise FileNotFoundError(f"Data not found at '{self.data_path}' in filesystem or Girder.")
-            
+
             files = list(local_gc.listFile(local_item['id'], limit=1))
             import tempfile
             tmp_data = os.path.join(tempfile.mkdtemp(), 'client_data.csv')
@@ -75,42 +82,39 @@ class FederatedCardioClient:
         else:
             y = df.iloc[:, -1].values.astype(int)
             X = df.iloc[:, :-1].values.astype(float)
-            
+
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
-        
+
         return torch.tensor(X_scaled, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
     def run_loop(self, hub_token: str):
         """Main execution loop handling Round-Robin with the Hub."""
         import torch.nn as nn
-        
-        if self.dropbox is None:
-            # Lazily initialize dropbox once we have a token, though we'd usually init in __init__
-            # If __init__ didn't have it, this fallback handles local testing without creds
-            import warnings
-            warnings.warn("Hub token might not be set on DropBox if initialized before token was available.")
-        
+
+        # Ensure the DropBox has the correct token for authentication
         self.dropbox.gc.token = hub_token
-        
+
         while True:
             print(f"[CLIENT] Waiting for next round...")
-            
+
             try:
-                # Ensure the dropbox is properly initialized with the work_path provided in __init__
-                # Note: GirderDropbox requires work_path to resolve folder_id in __init__, 
-                # so it should have been set when the class was instantiated.
-                
+                # Wait for the Hub to upload the new model weights
                 self.dropbox.wait_for_task_ready(round_num=self.client_id, timeout=300.0)
-                
+
                 global_weights = self.dropbox.read_task(self.client_id)
-                X_local, y_local = self._load_data()
+
+                X_local, y_local = self._load_data(hub_token, self.local_girder_url)
 
                 device = torch.device("cpu")
                 model = CardioNN(input_size=X_local.shape[1]).to(device)
                 model.load_state_dict(global_weights)
-                
-                train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X_local, y_local), batch_size=32, shuffle=True)
+
+                train_loader = torch.utils.data.DataLoader(
+                    torch.utils.data.TensorDataset(X_local, y_local),
+                    batch_size=32,
+                    shuffle=True
+                )
                 criterion = nn.CrossEntropyLoss()
                 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
@@ -132,35 +136,39 @@ class FederatedCardioClient:
                 break
             except Exception as e:
                 print(f"[CLIENT] Error: {e}")
-                raise 
+                raise
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Federated Cardio Worker (Girder File Transport)")
-    parser.add_argument('--client-id', required=True, help='Unique identifier for this distributed worker')
-    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1', help='Local Girder URL')
-    parser.add_argument('--hub-url', default='http://localhost:8080/api/v1', help='Hub Girder API URL')
-    parser.add_argument('--work-path', required=True, help='Hub Girder path to work folder')
-    parser.add_argument('--data-path', default='/dev/null', help='Local filesystem path OR local Girder item path')
-    
-    # --girder-token is typically passed from env or a separate arg in your CI/CD setup. 
-    # If testing locally, you may need to ensure GIRDER_API_KEY is exported.
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser()
 
-    import os
-    hub_cred_path = os.environ.get('SCLIW_HUB_CRED_PATH')
-    if hub_cred_path and os.path.exists(hub_cred_path):
-        with open(hub_cred_path) as f:
-            hub_token = f.read().strip()
-    else:
-        hub_token = 'default_dev_token_placeholder'
+    # Exactly matching the original scliw_federated arguments
+    parser.add_argument('--client-id', required=True, help='Client identifier')
+    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1',
+                        help='Local Girder URL')
+    parser.add_argument('--girder-token', required=True,
+                        help='Local Girder authentication token')
+    parser.add_argument('--hub-url', default='http://hub.example.com/api/v1',
+                        help='Hub Girder URL')
+    parser.add_argument('--hub-token', required=True,
+                        help='Hub authentication token')
+    parser.add_argument('--data-path', required=True,
+                        help='Local Girder path to csv data item')
+    parser.add_argument('--work-path', required=True,
+                        help='Hub Girder path to work folder')
+
+    args = parser.parse_args()
 
     worker = FederatedCardioClient(
         client_id=args.client_id,
         local_girder_url=args.girder_url,
+        local_token=args.girder_token,
         hub_url=args.hub_url,
+        hub_token=args.hub_token,
         work_path=args.work_path,
         data_path=args.data_path
     )
+    worker.local_token = args.girder_token
+    worker.local_girder_url = args.girder_url
 
-    worker.run_loop(hub_token=hub_token)
+    worker.run_loop(hub_token=args.hub_token)
