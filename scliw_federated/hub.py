@@ -1,126 +1,134 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.10"
+# requires-python = '>=3.10'
 # dependencies = [
-#     "girder-client==2.4.0",
-#     "torch>=2.0.0",
-#     "nvflare>=2.6.0",
+#     'girder-client',
+#     'torch',
 # ]
 # ///
 
 import argparse
 import os
-import tempfile
 import sys
-from typing import Dict, Optional, Any
 
-import torch
-import girder_client
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-try:
-    from .nvflare_bus import GirderEventBus
-except Exception:
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    if current_dir not in sys.path:
-        sys.path.insert(0, current_dir)
-    from nvflare_bus import GirderEventBus
-
-from nvflare.app_common.aggregators.in_time_accumulate_weighted_aggregator import InTimeAccumulateWeightedAggregator
+from nvflare_bus import GirderDropbox
 
 
-class FedHubCoordinator:
-    """
-    Central Coordinator for Cardio NVFlare-style Federated Learning.
-    Communicates with distributed clients exclusively via the Girder workspace
-    folder as a dropbox for model weights and task queueing.
-    """
-    def __init__(self, girder_url: str, girder_token: str, work_path: str, epochs: int, num_clients: int):
+class HubCoordinator:
+    def __init__(self, girder_url: str, work_path: str, epochs: int, num_clients: int, girder_token: str):
+        self.girder_url = girder_url
+        self.work_path = work_path
         self.epochs = int(epochs)
         self.num_clients = int(num_clients)
+        self.token = girder_token
 
-        # Initialize the bridge between NVFlare logic (averaging) and Girder Transport
-        self.bus = GirderEventBus(girder_url, girder_token, work_path)
+        import girder_client
+        self.gc = girder_client.GirderClient(apiUrl=self.girder_url)
+        self.gc.token = self.token
 
-        # Set up NVFlare's standard aggregation engine for federated learning
-        self.aggregator = InTimeAccumulateWeightedAggregator(
-            expected_data_kind='WEIGHTS'
+        self.workspace = self.gc.get('resource/lookup', parameters={'path': self.work_path})
+        if not self.workspace:
+            raise FileNotFoundError(f"Hub workspace '{self.work_path}' not found in Girder.")
+
+        # Initialize the NVFlare DropBox bridge
+        self.dropbox = GirderDropbox(
+            girder_url=girder_url,
+            girder_token=girder_token,
+            work_path=work_path
         )
 
     def run(self):
-        print(f'[HUB] Starting Federated Learning across {self.num_clients} spokes for {self.epochs} epochs.')
+        print(f'[HUB] Starting federated training with {self.epochs} epochs and {self.num_clients} clients.')
+        import torch
 
-        # Initial seed weights to distribute initially (NVFlare expects a starting point)
-        initial_weights = torch.nn.Linear(10, 2).state_dict()
-        self._seed_weights(initial_weights)
+        default_feat_size = 21 
+        initial_weights = {
+            'fc1.weight': torch.zeros(64, default_feat_size),   
+            'fc1.bias': torch.zeros(64),
+            'fc2.weight': torch.zeros(32, 64),
+            'fc2.bias': torch.zeros(32),
+            'fc3.weight': torch.zeros(2, 32),
+            'fc3.bias': torch.zeros(2)
+        }
+
+        # Seed the first global model using DropBox
+        self.dropbox.write_task(round_num=0, payload=initial_weights)
 
         for epoch in range(self.epochs):
-            print(f'--- Epoch {epoch + 1}/{self.epochs} ---')
-
-            # 1. Broadcast to all clients (via our event bus) instructing them to train this round
-            self.bus.publish_item(
-                name=f'global_model_epoch_{epoch}',
-                data={'status': 'train_ready', 'epoch': epoch}
+            print(f'\n--- Coordinating Epoch {epoch + 1}/{self.epochs} ---')
+            
+            # Create trigger marker item
+            self.gc.createItem(
+                parentFolderId=self.workspace['_id'], 
+                name=f'trigger_{int(epoch)}', 
+                metadata={'type': 'train'}
             )
 
-            # 2. Wait for the Hub's aggregation engine and our Bus to collect from spokes
-            gathered_weights = self.bus.fetch_model(
-                client_id='hub', expected_epoch=epoch + 1
+            print(f'[HUB] Waiting for {self.num_clients} workers to complete round {epoch + 1}...')
+            
+            # Wait for clients via DropBox protocol
+            completed = self.dropbox.wait_for_clients_complete(
+                round_num=int(epoch),
+                total_clients=self.num_clients,
+                timeout=600.0
             )
 
-            if not gathered_weights:
-                print("[HUB] No clients responded this round. Proceeding with previous global state.")
-                continue
+            if not completed:
+                print(f'[HUB] Warning: Not all clients responded for epoch {epoch + 1}')
 
-            # 3. Use NVFlare's standard aggregator logic to combine the distributed weights
-            aggregated_state = self.aggregator.aggregate(gathered_weights)
+            # Aggregate weights via DropBox protocol
+            new_global_state = self._load_client_weights(epoch)
+            
+            try:
+                self.dropbox.write_task(round_num=int(epoch) + 1, payload=new_global_state)
+            except Exception as e:
+                print(f"[HUB] Error writing aggregated weights: {e}")
+            
+        print('[HUB] Federated learning completed successfully.')
 
-            # Persist the new global model by publishing it to the bus for the NEXT epoch download
-            if aggregated_state:
-                 print(f"[HUB] Successfully aggregated weights from {len(gathered_weights)} clients.")
-                 self._seed_weights(aggregated_state)
-
-        # Signal shutdown after final epochs
-        self.bus.publish_item(name='global_model_shutdown', data={'status': 'shutdown'})
-        print("[HUB] Federated Learning cycle completed successfully.")
-
-    def _seed_weights(self, state_dict: Dict[str, torch.Tensor]):
-        """Uploads weights to the Hub's workspace for clients to poll via the Event Bus."""
-
-        # Create a temporary object for NVFlare-like passing through PyTorch persistence
-        path = os.path.join(tempfile.mkdtemp(), 'global_weights.pt')
-        torch.save(state_dict, path)
-
-        self.bus.gc.uploadFileToFolder(
-            self.bus.folder_id,
-            path,
-            f'task_epoch_{self.epochs}_weights_hub_final.pt', # Final epoch marker
-            metadata = {'type': 'seed'}
-        )
+    def _load_client_weights(self, epoch):
+        """Downloads weight updates from all clients for a given epoch and averages them."""
+        client_results = self.dropbox.read_all_results(epoch)
+        
+        if not client_results:
+             raise RuntimeError(f"No client weights found in folder for epoch {epoch}")
+             
+        import torch
+        
+        aggregated_weights = None
+        
+        for result in client_results:
+            if aggregated_weights is None:
+                aggregated_weights = {k: v.clone() * 0.0 for k, v in result.items()}
+                
+            for key in aggregated_weights.keys():
+                if key in result:
+                    aggregated_weights[key].add_(result[key])
+        
+        for key in aggregated_weights.keys():
+            aggregated_weights[key] /= len(client_results)
+            
+        return aggregated_weights
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1',
-                        help='Local Girder URL')
-    parser.add_argument('--girder-token', required=True,
-                        help='Local Girder authentication token')
-    parser.add_argument('--work-path', required=True,
-                        help='Hub Girder path to work folder')
-    parser.add_argument('--epochs', type=int, default=5,
-                        help='Number of epochs to run')
-    parser.add_argument('--clients', type=int, default=4,
-                        help='Number of clients to expect')
-
+    parser = argparse.ArgumentParser(description="Hub Coordinator for Cardio NVFlare")
+    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1', help='Hub Girder URL')
+    parser.add_argument('--work-path', required=True, help='Hub Girder path to work folder')
+    parser.add_argument('--epochs', type=int, default=5, help='Number of federated training rounds')
+    parser.add_argument('--clients', type=int, default=4, help='Number of distributed clients expected')
+    parser.add_argument('--girder-token', required=True, help='Hub Girder authentication token')
+    
     args = parser.parse_args()
 
-    # Initialize Hub Coordinator with Girder connection details
-    hub = FedHubCoordinator(
+    hub = HubCoordinator(
         girder_url=args.girder_url,
-        girder_token=args.girder_token,
         work_path=args.work_path,
         epochs=args.epochs,
-        num_clients=args.clients
+        num_clients=args.clients,
+        girder_token=args.girder_token
     )
-
-    # Start the Federated Learning coordinator loop
+    
     hub.run()
