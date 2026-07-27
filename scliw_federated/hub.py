@@ -13,7 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from nvflare_bus import GirderDropbox
+from nvflare_bus import GirderBridge
 
 
 class HubCoordinator:
@@ -21,10 +21,11 @@ class HubCoordinator:
         self.work_path = work_path
         self.epochs = int(epochs)
         self.num_clients = int(num_clients)
-        self.gc = None  # Placeholder, initialized in run
+        self.girder_url = None  # Initialized in _init_components
+        self.gc = None  
         self.workspace = None
         self.folder_id = None
-        self.dropbox = None
+        self.girder_bridge = None
 
     def _init_components(self, girder_token: str):
         import girder_client
@@ -40,8 +41,8 @@ class HubCoordinator:
             
         self.folder_id = self.workspace['_id']
 
-        # Initialize the NVFlare DropBox bridge using explicit authentication (no env fallbacks)
-        self.dropbox = GirderDropbox(
+        # Initialize the NVFlare Girder Bridge using explicit authentication (no env fallbacks)
+        self.girder_bridge = GirderBridge(
             girder_url=self.girder_url,
             girder_token=girder_token,
             work_path=self.work_path
@@ -51,7 +52,7 @@ class HubCoordinator:
         import torch
         
         # Ensure components are initialized with the provided hub token
-        if not self.dropbox:
+        if not self.girder_bridge:
             self._init_components(girder_token)
             
         print(f'[HUB] Starting federated training with {self.epochs} epochs and {self.num_clients} clients.')
@@ -66,42 +67,39 @@ class HubCoordinator:
             'fc3.bias': torch.zeros(2)
         }
 
-        self.dropbox.write_task(round_num=0, payload=initial_weights)
+        self.girder_bridge.write_task(round_num=0, payload=initial_weights)
 
         for epoch in range(self.epochs):
             print(f'\n--- Coordinating Epoch {epoch + 1}/{self.epochs} ---')
             
-            # Create trigger marker item
-            self.gc.createItem(
-                parentFolderId=self.folder_id, 
-                name=f'trigger_{int(epoch)}', 
-                metadata={'type': 'train'}
-            )
+            # Create trigger marker item via the bridge's synchronous poll mechanism
+            self.girder_bridge._create_marker_item(f'trigger_{int(epoch)}')
 
             print(f'[HUB] Waiting for {self.num_clients} workers to complete round {epoch + 1}...')
             
-            # Wait for clients via DropBox protocol
-            completed = self.dropbox.wait_for_clients_complete(
+            # Wait for clients via Girder Bridge protocol with explicit HTTP polling
+            completed = self.girder_bridge.wait_for_clients_complete(
                 round_num=int(epoch),
                 total_clients=self.num_clients,
-                timeout=600.0
+                timeout=600.0,
+                poll_interval=2.0
             )
 
             if not completed:
                 print(f'[HUB] Warning: Not all clients responded for epoch {epoch + 1}')
 
-            # Aggregate weights via DropBox protocol
+            # Aggregate weights via Girder Bridge protocol
             new_global_state = self._load_client_weights(epoch)
             
             try:
-                self.dropbox.write_task(round_num=int(epoch) + 1, payload=new_global_state)
+                self.girder_bridge.write_task(round_num=int(epoch) + 1, payload=new_global_state)
             except Exception as e:
                 print(f"[HUB] Error writing aggregated weights: {e}")
             
         print('[HUB] Federated learning completed successfully.')
 
     def _load_client_weights(self, epoch):
-        client_results = self.dropbox.read_all_results(epoch)
+        client_results = self.girder_bridge.read_all_results(epoch)
         
         if not client_results:
              raise RuntimeError(f"No client weights found in folder for epoch {epoch}")
@@ -131,13 +129,13 @@ if __name__ == '__main__':
     parser.add_argument('--girder-url', default='http://localhost:8080/api/v1',
                         help='Hub Girder URL')
     parser.add_argument('--girder-token', required=True,
-                        help='Hub Girder authentication token')
+                        help='Hub Girder authentication token (B64-encoded JWT or API key)')
     parser.add_argument('--work-path', required=True,
                         help='Hub Girder path to work folder')
     parser.add_argument('--epochs', type=int, default=3,
                         help='Number of epochs to run')
     parser.add_argument('--clients', type=int, default=4,
-                        help='Number of clients to expect')
+                        help="Number of clients to expect for aggregation")
             
     args = parser.parse_args()
     

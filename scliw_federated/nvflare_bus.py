@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = '>=3.10'
-# dependencies = [
-#     'girder-client',
-#     'nvflare',
-# ]
-# ///
 
 import os
 import tempfile
@@ -15,11 +8,10 @@ import json
 import girder_client
 
 
-class GirderDropbox:
+class GirderBridge:
     """
-    A DropBox implementation that routes file transfers via a Girder workspace folder.
-    This preserves the `FileTransferDropbox` requirements of the NVFlare
-    architecture while leveraging your existing scliw_federated artifact exchange.
+    A bridge implementation that routes artifact transfer via a Girder workspace folder.
+    Replaces the standard FLARE FileTransfer mechanism with a polling-based Girder interface.
     """
 
     def __init__(self, girder_url: str, girder_token: str, work_path: str):
@@ -29,60 +21,43 @@ class GirderDropbox:
 
         workspace = self.gc.get('resource/lookup', parameters={'path': work_path})
         if not workspace:
-            raise FileNotFoundError(f"Girder Workspace '{work_path}' not found in Girder.")
+            raise FileNotFoundError(f"Girder Workspace '{work_path}' not found.")
 
         self.folder_id = workspace['_id']
 
-    def _upload_attachment(self, source_path: str, filename: str) -> None:
-        """Helper to upload a file attachment to the workspace folder."""
-        self.gc.uploadFileToFolder(
-            self.folder_id,
-            source_path,
-            filename,
-        )
+    def _get_current_items(self) -> list:
+        """Helper to get a fresh list of items from Girder."""
+        return list(self.gc.listItem(self.folder_id))
 
-    def _download_attachment(self, filename: str, dest_path: str) -> bool:
-        """Helper to find an item by name and download its first attachment."""
-        items = list(self.gc.listItem(self.folder_id))
-        target_item = None
+    def _wait_for_marker(self, marker_name: str, timeout: float = 300.0, poll_interval: float = 2.0) -> bool:
+        """Poll until a specific Marker Item exists in the workspace."""
+        deadline = time.time() + timeout
+        
+        # Ensure we don't hammer the HTTP(S) endpoint
+        last_poll_time = 0 
+        while time.time() < deadline:
+            if time.time() - last_poll_time >= poll_interval:
+                items = self._get_current_items()
+                for item in items:
+                    if item['name'] == marker_name:
+                        return True
+                
+                # If not found, enforce a pause before next HTTP request
+                time.sleep(poll_interval) 
+                last_poll_time = time.time()
+            else:
+                time.sleep(0.1)
 
-        for item in items:
-            if filename in item['name']:
-                target_item = item
-                break
-
-        if not target_item:
-            return False
-
-        files = list(self.gc.listFile(target_item['_id'], limit=1))
-        if files:
-            self.gc.downloadFile(files[0]['_id'], dest_path)
-            return True
         return False
 
     def _create_marker_item(self, marker_name: str) -> None:
         """Create a trigger/completed marker Item in Girder."""
-        self.gc.createItem(
-            parentFolderId=self.folder_id,
-            name=marker_name,
-            metadata={"type": "marker", "source": "nvflare_bus"}
-        )
-
-    def _wait_for_marker(self, marker_name: str, timeout: float = 300.0, poll_interval: float = 1.0) -> bool:
-        """Poll until a marker Item exists in the workspace."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            items = list(self.gc.listItem(self.folder_id))
-            for item in items:
-                if item['name'] == marker_name:
-                    return True
-            time.sleep(poll_interval)
-        return False
+        self.gc.createItem(parentFolderId=self.folder_id, name=marker_name, metadata={"type": "marker"})
 
     def write_task(self, round_num: int, payload):
-        """Server/Hub writes the global model (or trigger data) to Girder."""
-        task_folder_marker = f'task_{round_num}_ready'
+        """Hub writes the global model (or trigger data) to Girder."""
         task_file_name = f'model_epoch_{int(round_num)}.pt'
+        marker_name = f'task_{round_num}_ready'
 
         tmp_dir = tempfile.mkdtemp()
         source_path = os.path.join(tmp_dir, task_file_name)
@@ -95,31 +70,31 @@ class GirderDropbox:
                 import pickle
                 pickle.dump(payload, f)
 
-        # 1. Upload the payload attachment
-        self._upload_attachment(source_path, task_file_name)
+        self.gc.uploadFileToFolder(self.folder_id, source_path, task_file_name)
+        self._create_marker_item(marker_name)
 
-        # 2. Create the marker Item to signal readiness to clients
-        self._create_marker_item(task_folder_marker)
-
-    def wait_for_task_ready(self, round_num: int, timeout=300.0, poll_interval=1.0) -> bool:
-        """Clients poll until the Hub has uploaded the task."""
-        ready_marker = f'task_{round_num}_ready'
-        return self._wait_for_marker(ready_marker, timeout, poll_interval)
+    def wait_for_task_ready(self, round_num: int, timeout=300.0, poll_interval=2.0) -> bool:
+        """Clients poll until the Hub has uploaded the task for a specific round."""
+        marker = f'task_{round_num}_ready'
+        return self._wait_for_marker(marker, timeout, poll_interval)
 
     def read_task(self, round_num: int):
         """Client reads the global model from Girder."""
         task_file_name = f'model_epoch_{int(round_num)}.pt'
-
         tmp_dir = tempfile.mkdtemp()
         dest_path = os.path.join(tmp_dir, task_file_name)
 
-        success = self._download_attachment(task_file_name, dest_path)
-        if not success:
-            raise RuntimeError(f"Could not read task {round_num} from Girder DropBox")
+        items = self._get_current_items()
+        target_item = next((i for i in items if task_file_name in i.get('name', '')), None)
 
-        import torch
-        with open(dest_path, 'rb') as f:
-            return torch.load(f, map_location='cpu')
+        if not target_item:
+            return None
+            
+        files = list(self.gc.listFile(target_item['_id'], limit=1))
+        if files:
+            self.gc.downloadFile(files[0]['_id'], dest_path)
+            import torch
+            return torch.load(dest_path, map_location='cpu')
 
     def write_result(self, client_id: int, round_num: int, payload):
         """Client writes its update to Girder."""
@@ -131,37 +106,26 @@ class GirderDropbox:
         import torch
         if isinstance(payload, dict):
             torch.save(payload, dest_path)
-        else:
-            with open(dest_path, 'wb') as f:
-                import pickle
-                pickle.dump(payload, f)
-
-        self._upload_attachment(dest_path, result_file_name)
-
-        completion_marker = f'completed_{client_id}_{round_num}'
-        self._create_marker_item(completion_marker)
+        
+        self.gc.uploadFileToFolder(self.folder_id, dest_path, result_file_name)
+        marker_name = f'completed_{client_id}_{round_num}'
+        self._create_marker_item(marker_name)
 
     def wait_for_clients_complete(
-            self, round_num: int, total_clients: int, timeout=300.0, poll_interval=1.0
+            self, round_num: int, total_clients: int, timeout=300.0, poll_interval=2.0
     ) -> bool:
         """Hub polls until all clients have uploaded results."""
         deadline = time.time() + timeout
         completed_count = 0
-
+        
         while (completed_count < total_clients) and (time.time() < deadline):
-            items = list(self.gc.listItem(self.folder_id))
-
+            items = self._get_current_items()
+            
             for item in items:
-                # Check if this item represents a completed result for ANY client
-                if f'completed_' in item['name'] and f'{round_num}' in item['name']:
-                    try:
-                        parts = item['name'].split('_')
-                        # 'completed_X_Y_roundZ' is the expected format from write_result
-                        if len(parts) >= 3 and parts[0] == 'completed':
-                            completed_count += 1
-                    except Exception:
-                        pass
-
+                name = item['name']
+                if f'completed_' in name and f'{round_num}' in name:
+                    completed_count += 1
+            
             if completed_count < total_clients:
                 time.sleep(poll_interval)
 
@@ -169,47 +133,26 @@ class GirderDropbox:
 
     def read_all_results(self, round_num: int) -> list:
         """Hub reads results from all clients."""
-        items = list(self.gc.listItem(self.folder_id))
+        items = self._get_current_items()
         results = []
 
         for item in items:
             if 'result_' in item['name'] and f'epoch_{int(round_num)}' in item['name']:
                 tmp_dir = tempfile.mkdtemp()
                 dest_path = os.path.join(tmp_dir, item['name'])
-
                 files = list(self.gc.listFile(item['_id'], limit=1))
                 if files:
                     self.gc.downloadFile(files[0]['_id'], dest_path)
-
-                    if item['name'].endswith('.pt'):
-                        import torch as torch_module
-                        results.append(torch_module.load(dest_path, map_location='cpu'))
-                    else:
-                        with open(dest_path, 'r') as f:
-                            results.append(json.load(f))
+                    import torch as torch_module
+                    results.append(torch_module.load(dest_path, map_location='cpu'))
         return results
 
-    def write_notification(self, msg_type: str, data):
-        """Sends a stop signal or similar control message."""
+    def write_notification(self, msg_type: str):
         marker_name = f'notification_{msg_type}'
         self._create_marker_item(marker_name)
 
     def read_notifications(self) -> list:
-        """Polls for notifications (e.g., shutdown/stop)."""
-        items = list(self.gc.listItem(self.folder_id))
+        items = self._get_current_items()
         if any('notification_STOP' in item['name'] for item in items):
             return [True]
         return []
-
-
-class GirderEventBus:
-    """
-    A bridge between NVFlare's internal messaging and our Girder-based DropBox.
-    """
-
-    def __init__(self, dropbox: GirderDropbox):
-        self.dropbox = dropbox
-        self.task_queue = []
-
-    def get_event_bus(self):
-        return None  # NVFlare uses the executor/dropbox for state sync in this setup.
