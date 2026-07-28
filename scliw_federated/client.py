@@ -15,26 +15,22 @@ import os
 import sys
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-
-from scliw_federated.nvflare_bus import GirderBridge
-import girder_client
-
-# Use NVFlare's standard FL context and data sharing constructs for task tracking
-from nvflare.apis.fl_context import FLContext
-from nvflare.apis.shareable import Shareable, ShareableKey
-
 
 class FederatedCardioClient:
+    """
+    Client-side federated learning worker using NVFlare logic + Girder Bridge.
+    Maintains strict data isolation while communicating via the Girder asset system.
+    Handles dimension mismatches (e.g., local CSV having 13 features vs Hub expecting 21) via zero-padding.
+    """
+
     def __init__(self, client_id: int, local_girder_url: str, hub_url: str, hub_token,
                  work_path: str, data_path: str):
         self.client_id = client_id
         self.data_path = data_path
-        
-        # Track local girder connection for fallback / asset resolution
-        self.local_girder_url = local_girder_url
 
-        # Initialize communication transport to Hub Girder via the bridge
+        # Initialize connection to Hub Girder via the bridge
+        from scliw_federated.nvflare_bus import GirderBridge
+
         self.girder_bridge = GirderBridge(
             girder_url=hub_url,
             girder_token=hub_token,
@@ -46,27 +42,36 @@ class FederatedCardioClient:
         import pandas as pd
         from sklearn.preprocessing import StandardScaler
 
-        df = None
-        # Priority 1: Loads data directly from filesystem mount (UCI Cardio)
+        # Try direct filesystem access first (UCI Cardio typically at /dataset.csv or similar)
         if os.path.exists(self.data_path):
             print(f"[*] Loading data directly from mounted filesystem: {self.data_path}")
+            # UCI datasets often use semicolon delimiters, try comma then semi
             for sep in [';', ',']:
                 try:
                     df = pd.read_csv(self.data_path, sep=sep)
                     break
                 except Exception: continue
         else:
-            # Priority 2: Download from local Girder (Asset fallback)
+            import girder_client
+
+            # Priority 2: Download from local Girder (Original pattern)
             local_gc = girder_client.GirderClient(apiUrl=local_girder_url)
             if hasattr(self, 'local_token') and self.local_token:
                 local_gc.token = self.local_token
 
             local_item = local_gc.get('resource/lookup', parameters={'path': self.data_path})
             if not local_item:
+                import tempfile
+                # Attempt to treat it as a file path if Girder returns nothing (local test fallback)
+                if os.path.exists(self.data_path):
+                     print(f"[*] Fallback to direct file access for '{self.data_path}'");
+                     raise FileNotFoundError(...) # Handled by the block below anyway
+
+            local_item = local_gc.get('resource/lookup', parameters={'path': self.data_path})
+            if not local_item:
                 raise FileNotFoundError(f"Data not found at '{self.data_path}' in filesystem or Girder.")
 
             files = list(local_gc.listFile(local_item['_id'], limit=1))
-            import tempfile
             tmp_data = os.path.join(tempfile.mkdtemp(), 'client_data.csv')
             local_gc.downloadFile(files[0]['_id'], tmp_data)
 
@@ -89,7 +94,7 @@ class FederatedCardioClient:
 
         # --- Dimension Padding for Mismatched Schema ---
         import numpy as np
-        
+
         target_dim = len(X[0])
         if hasattr(self, 'global_weights') and self.global_weights is not None and 'fc1.weight' in self.global_weights:
              target_dim = self.global_weights['fc1.weight'].shape[1]
@@ -110,6 +115,9 @@ class FederatedCardioClient:
 
     def run_loop(self, hub_token: str):
         import torch.nn as nn
+        from nvflare.apis.shareable import Shareable
+        from nvflare.apis.fl_context import FLContext
+        from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
 
         current_round = 0
         total_epochs = 100
@@ -142,7 +150,7 @@ class FederatedCardioClient:
             X_local, y_local = self._load_data(hub_token, self.local_girder_url)
 
             device = torch.device("cpu")
-            model = CardioNN(input_size=X_local.shape[1]).to(device) 
+            model = CardioNN(input_size=X_local.shape[1]).to(device) # Will automatically match padded features
             model.load_state_dict(global_weights)
 
             train_loader = torch.utils.data.DataLoader(
@@ -150,7 +158,7 @@ class FederatedCardioClient:
                 batch_size=32, shuffle=True
             )
             criterion = nn.CrossEntropyLoss()
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.1) 
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
 
             model.train()
             for _epoch in range(3): # Simulate 3 local epochs
@@ -165,12 +173,11 @@ class FederatedCardioClient:
 
             updated_weights = model.state_dict()
 
-            # Tag the update using NVFlare's standardized Shareable mechanism before transfer
-            update_share = Shareable()
-            update_share.set_data(key="WEIGHTS", data=updated_weights)
-            update_share.set_shareable_key(ShareableKey.AGGREGATION_INDEX, str(self.client_id))
-
             print(f"[CLIENT] Uploading result for round {current_round}...")
+            update_share = Shareable()
+            # Use a standard key; NVFlare's aggregator will handle it via AGG_INDEX or list order
+            update_share.set_data(key="WEIGHTS", data=updated_weights)
+
             self.girder_bridge.write_result(
                 client_id=self.client_id,
                 round_num=current_round,
@@ -186,35 +193,38 @@ class CardioNN(torch.nn.Module):
         self.fc1 = torch.nn.Linear(input_size, 64)
         self.relu = torch.nn.ReLU()
         self.fc2 = torch.nn.Linear(64, 32)
-        self.fc3 = torch.nn.Linear(32, 2)
+        self.fc3 = torch.nn.Linear(32, 2) # Assuming binary/multi-class output
 
     def forward(self, x):
         return self.fc3(self.relu(self.fc2(self.relu(self.fc1(x)))))
 
 
 if __name__ == '__main__':
+    here = os.path.abspath(os.path.dirname(os.path.abspath(__file__)))
+    if here not in sys.path:
+        sys.path.insert(0, here)
     parser = argparse.ArgumentParser()
-
-    # Identical arguments to the original setup
     parser.add_argument('--client-id', required=True, help='Client identifier')
-    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1', help='Local Girder URL')
-    parser.add_argument('--girder-token', required=True, help='Local Girder authentication token')
-    parser.add_argument('--hub-url', default='http://hub.example.com/api/v1', help='Hub Girder URL')
-    parser.add_argument('--hub-token', required=True, help='Hub authentication token')
-    parser.add_argument('--data-path', required=True, help='Local data path to csv or local girder asset path')
-    parser.add_argument('--work-path', required=True, help='Hub Girder path to work folder')
-
+    parser.add_argument('--girder-url', default='http://localhost:8080/api/v1',
+                        help='Local Girder URL')
+    parser.add_argument('--girder-token', required=True,
+                        help='Local Girder authentication token')
+    parser.add_argument('--hub-url', default='http://hub.example.com/api/v1',
+                        help='Hub Girder URL')
+    parser.add_argument('--hub-token', required=True,
+                        help='Hub authentication token')
+    parser.add_argument('--data-path', required=True,
+                        help='Local Girder path to csv data item')
+    parser.add_argument('--work-path', required=True,
+                        help='Hub Girder path to work folder')
     args = parser.parse_args()
-
     worker = FederatedCardioClient(
         client_id=args.client_id,
-        local_girder_url=args.hub_url, # Fallback URL for local assets
-        hub_url=args.hub_url,           # Communication target
-        hub_token=args.hub_token, 
+        local_girder_url=args.girder_url,
+        hub_url=args.hub_url,
+        hub_token=args.hub_token,
         work_path=args.work_path,
         data_path=args.data_path
     )
-    worker.local_token = args.hub_token
-    
-    # Run the client loop (communication remains strictly Girder-polling based)
+    worker.local_token = args.girder_token
     worker.run_loop(hub_token=args.hub_token)

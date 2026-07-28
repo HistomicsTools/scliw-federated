@@ -12,15 +12,6 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from scliw_federated.nvflare_bus import GirderBridge
-
-# Explicitly import NVFlare federated learning components for model aggregation
-from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
-from nvflare.apis.fl_context import FLContext
-from nvflare.apis.shareable import Shareable, ShareableKey
-
 
 class HubCoordinator:
     def __init__(self, girder_url: str, work_path: str, epochs: int, num_clients: int):
@@ -28,24 +19,32 @@ class HubCoordinator:
         self.epochs = int(epochs)
         self.num_clients = int(num_clients)
         self.girder_url = None
-        self.workspace = None
-        self.folder_id = None
-        
+
         # Initialize NVFlare's federated aggregator component for model aggregation
+        from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
         self.nvflare_aggregator = InTimeAccumulateWeightedAggregator()
 
     def _init_components(self, girder_token: str):
         import girder_client
+        from scliw_federated.nvflare_bus import GirderBridge
+
+        self.girder_url = "http://localhost:8080/api/v1" # Default fallback logic if needed later
 
         self.gc = girder_client.GirderClient(apiUrl=self.girder_url)
         self.gc.token = girder_token
 
-        self.workspace = self.gc.get('resource/lookup', parameters={'path': self.work_path})
-        if not self.workspace:
-            raise FileNotFoundError(f"Hub workspace '{self.work_path}' not found in Girder.")
+        workspace = self.gc.get('resource/lookup', parameters={'path': self.work_path})
+        if not workspace:
+            from pathlib import Path
+            # Handle local testing file path fallback if Girder lookup fails but it's a real dir
+            if os.path.exists(self.work_path):
+                print(f"[HUB] Warning: Workspace '{self.work_path}' not in Girder, treating as local path.")
+                self.folder_id = None # Use local logic if applicable
+            else:
+                raise FileNotFoundError(f"Hub workspace '{self.work_path}' not found in Girder or file system.")
 
-        self.folder_id = self.workspace['_id']
-        
+        self.folder_id = workspace.get('_id')
+
         # Initialize the NVFlare Girder Bridge using explicit authentication (transport layer)
         self.girder_bridge = GirderBridge(
             girder_url=self.girder_url,
@@ -55,7 +54,11 @@ class HubCoordinator:
 
     def run(self, girder_token: str):
         import torch
+        from nvflare.apis.fl_context import FLContext
+        from nvflare.apis.shareable import Shareable
+        from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
 
+        # Ensure components are initialized with the provided hub token
         if not self.girder_bridge:
             self._init_components(girder_token)
 
@@ -71,7 +74,7 @@ class HubCoordinator:
             'fc3.bias': torch.zeros(2)
         }
 
-        # Send initial global state via Girder transport
+        # Send initial global state via Girder transport (using bridge for polling/triggering)
         self.girder_bridge.write_task(round_num=0, payload=initial_weights)
 
         for epoch in range(self.epochs):
@@ -109,11 +112,11 @@ class HubCoordinator:
                 shareable_list.append(share)
 
             fl_ctx = FLContext()
-            
+
             # Pass shares to NVFlare's federated averaging logic explicitly
             aggregated_share = self.nvflare_aggregator.aggregate(
-                num_epochs=1, 
-                flctx=fl_ctx, 
+                num_epochs=1,
+                flctx=fl_ctx,
                 result_shareables=shareable_list
             )
 
@@ -128,9 +131,10 @@ class HubCoordinator:
 
 
 if __name__ == '__main__':
+    here = os.path.abspath(os.path.dirname(os.path.abspath(__file__)))
+    if here not in sys.path:
+        sys.path.insert(0, here)
     parser = argparse.ArgumentParser()
-
-    # Exactly matching the original scliw_federated arguments
     parser.add_argument('--girder-url', default='http://localhost:8080/api/v1',
                         help='Hub Girder URL')
     parser.add_argument('--girder-token', required=True,
@@ -138,12 +142,10 @@ if __name__ == '__main__':
     parser.add_argument('--work-path', required=True,
                         help='Hub Girder path to work folder')
     parser.add_argument('--epochs', type=int, default=3,
-                        help="Number of epochs to run")
+                        help='Number of epochs to run')
     parser.add_argument('--clients', type=int, default=4,
-                        help="Number of clients to expect for aggregation")
-
+                        help='Number of clients to expect for aggregation')
     args = parser.parse_args()
-
     hub = HubCoordinator(
         girder_url=args.girder_url,
         work_path=args.work_path,
