@@ -31,14 +31,14 @@ class GirderBridge:
     def _wait_for_marker(self, marker_name: str, timeout: float = 300.0, poll_interval: float = 2.0) -> bool:
         """Poll until a specific Marker Item exists in the workspace."""
         deadline = time.time() + timeout
-        
+
         while time.time() < deadline:
             items = self._get_current_items()
-            
+
             for item in items:
                 if item['name'] == marker_name:
                     return True
-            
+
             time.sleep(poll_interval)
 
         return False
@@ -84,7 +84,7 @@ class GirderBridge:
         target_item = next((i for i in items if task_file_name in i.get('name', '')), None)
         if not target_item:
             return None
-            
+
         files = list(self.gc.listFile(target_item['_id'], limit=1))
         if files:
             self.gc.downloadFile(files[0]['_id'], dest_path)
@@ -93,7 +93,7 @@ class GirderBridge:
 
     def write_result(self, client_id, round_num: int, payload):
         """Client writes its update to Girder."""
-        safe_client_id = str(client_id) 
+        safe_client_id = str(client_id)
         result_file_name = f'result_{safe_client_id}_epoch_{round_num}.pt'
 
         tmp_dir = tempfile.mkdtemp()
@@ -102,7 +102,7 @@ class GirderBridge:
         import torch
         if isinstance(payload, dict):
             torch.save(payload, dest_path)
-        
+
         self.gc.uploadFileToFolder(self.folder_id, dest_path, result_file_name)
         marker_name = f'completed_{safe_client_id}_{round_num}'
         self._create_marker_item(marker_name)
@@ -113,15 +113,16 @@ class GirderBridge:
         """Hub polls until all clients have uploaded results."""
         deadline = time.time() + timeout
         completed_count = 0
-        
+
         while (completed_count < total_clients) and (time.time() < deadline):
             items = self._get_current_items()
-            
+
+            completed_count = 0
             for item in items:
                 name = item['name']
-                if f'completed_' in name and f'{round_num}' in name:
+                if f'completed_' in name and name.endswith(f'_{round_num}'):
                     completed_count += 1
-            
+
             if completed_count < total_clients:
                 time.sleep(poll_interval)
 
@@ -131,12 +132,12 @@ class GirderBridge:
         """Hub reads results from all clients."""
         items = self._get_current_items()
         results = []
-        
-        seen = set() 
-        
+
+        seen = set()
+
         for item in items:
             name = item['name']
-            if 'result_' in name and f'epoch_{round_num}' in name:
+            if 'result_' in name and f'epoch_{round_num}.' in name:
                 safe_name = self.sanitize_filename(name)
                 if safe_name in seen:
                     continue
@@ -144,12 +145,13 @@ class GirderBridge:
 
                 tmp_dir = tempfile.mkdtemp()
                 dest_path = os.path.join(tmp_dir, safe_name)
-                
+
                 files = list(self.gc.listFile(item['_id'], limit=1))
                 if files:
                     self.gc.downloadFile(files[0]['_id'], dest_path)
                     import torch as torch_module
                     results.append(torch_module.load(dest_path, map_location='cpu'))
+                    print(f'read {name}')
         return results
 
     def write_notification(self, msg_type: str):

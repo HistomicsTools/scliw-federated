@@ -49,7 +49,7 @@ class FederatedCardioClient:
         if os.path.exists(self.data_path):
             print(f"[*] Loading data directly from mounted filesystem: {self.data_path}")
             # UCI datasets often use semicolon delimiters, try comma then semi
-            for sep in [';', ',']: 
+            for sep in [';', ',']:
                 try:
                     df = pd.read_csv(self.data_path, sep=sep)
                     break
@@ -68,7 +68,7 @@ class FederatedCardioClient:
             import tempfile
             tmp_data = os.path.join(tempfile.mkdtemp(), 'client_data.csv')
             local_gc.downloadFile(files[0]['_id'], tmp_data)
-            
+
             for sep in [';', ',']:
                 try:
                     df = pd.read_csv(tmp_data, sep=sep)
@@ -89,7 +89,7 @@ class FederatedCardioClient:
         # --- Dimension Padding for Mismatched Schema ---
         import torch
         import numpy as np
-        
+
         target_dim = len(X[0])
         if hasattr(self, 'global_weights') and 'fc1.weight' in self.global_weights:
              target_dim = self.global_weights['fc1.weight'].shape[1]
@@ -108,14 +108,14 @@ class FederatedCardioClient:
              X_scaled = scaler.fit_transform(X)
         else:
              X_scaled = scaler.fit_transform(X.cpu().numpy())
-             
+
         return torch.tensor(X_scaled, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
     def run_loop(self, hub_token: str):
         import torch.nn as nn
 
         current_round = 0
-        total_epochs = 1 # Set to 1 to prove a single epoch roundtrip completes cleanly.
+        total_epochs = 100
         print(f"[CLIENT] Starting loop for client ID {self.client_id}.")
 
         while current_round < total_epochs:
@@ -139,9 +139,9 @@ class FederatedCardioClient:
             if global_weights is None:
                 print(f"[CLIENT] No model weights found for epoch {current_round}.")
                 continue
-            
+
             # Store weights for _load_data padding logic reference if needed (or just use shape dim)
-            self.global_weights = global_weights 
+            self.global_weights = global_weights
 
             X_local, y_local = self._load_data(hub_token, self.local_girder_url)
 
@@ -161,7 +161,7 @@ class FederatedCardioClient:
                 for X_batch, y_batch in train_loader:
                     X_batch = X_batch.to(device)
                     y_batch = y_batch.to(device)
-                    
+
                     optimizer.zero_grad()
                     loss = criterion(model(X_batch), y_batch)
                     loss.backward()
@@ -177,8 +177,6 @@ class FederatedCardioClient:
             )
 
             current_round += 1
-
-            
 
 
 class CardioNN(torch.nn.Module):
@@ -216,7 +214,7 @@ if __name__ == '__main__':
         data_path=args.data_path
     )
     worker.local_token = args.girder_token # Pass local token for fallback downloads
-    
+
     worker.local_girder_url = args.girder_url
     worker.local_token = args.girder_token # Assuming token applies to local girder too for fallback
     worker.run_loop(hub_token=args.hub_token)
