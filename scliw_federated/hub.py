@@ -4,14 +4,19 @@
 # dependencies = [
 #     'girder-client',
 #     'torch',
+#     'nvflare',
 # ]
 # ///
 
 import argparse
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
+from nvflare.app_common.shareablegenerators.full_model_shareable_generator import FullModelShareableGenerator
 
 from nvflare_bus import GirderBridge
 
@@ -99,27 +104,52 @@ class HubCoordinator:
         print('[HUB] Federated learning completed successfully.')
 
     def _load_client_weights(self, epoch):
+        """
+        Retrieve client weights from Girder and aggregate them using NVFlare's native
+        InTimeAccumulateWeightedAggregator. This allows us to use NVFlare's logic
+        for weighted aggregation while communicating via our custom Girder polling protocol.
+        """
+        print("[HUB] Fetching client updates from Girder...")
         client_results = self.girder_bridge.read_all_results(epoch)
 
         if not client_results:
             raise RuntimeError(f"No client weights found in folder for epoch {epoch}")
 
-        import torch
+        # Initialize NVFlare aggregation components
+        aggregator = InTimeAccumulateWeightedAggregator(expected_data_kind='WEIGHTS')
+        generator = FullModelShareableGenerator()
 
-        aggregated_weights = None
+        shareables_to_aggregate = []
+        try:
+            print("[HUB] Wrapping weight updates into NVFlare Shareability objects...")
+            for weights_dict in client_results:
+                # Wrap the raw PyTorch state dict into an NVFlare Shareable object
+                share = generator.make_shareable(weights_dict)
+                shareables_to_aggregate.append(share)
 
-        for result in client_results:
-            if aggregated_weights is None:
-                aggregated_weights = {k: v.clone() * 0.0 for k, v in result.items()}
+            print("[HUB] Aggregating local models using NVFlare's InTimeAccumulateWeightedAggregator...")
+            result = aggregator.aggregate(shareables_to_aggregate)
 
+            # Extract the aggregated weights from the resulting Shareable
+            new_global_state = dict(result) if hasattr(result, 'items') else result
+            print("[HUB] Aggregation complete.")
+            return new_global_state
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[HUB] Error using NVFlare aggregator: {e}. Falling back to manual aggregation.")
+            # Fallback to manual averaging just in case of version incompatibilities or weird state dict issues
+            import torch
+            aggregated_weights = None
+            for result in client_results:
+                if aggregated_weights is None:
+                    aggregated_weights = {k: v.clone() * 0.0 for k, v in result.items()}
+                for key in aggregated_weights.keys():
+                    if key in result:
+                        aggregated_weights[key].add_(result[key])
             for key in aggregated_weights.keys():
-                if key in result:
-                    aggregated_weights[key].add_(result[key])
-
-        for key in aggregated_weights.keys():
-            aggregated_weights[key] /= len(client_results)
-
-        return aggregated_weights
+                aggregated_weights[key] /= len(client_results)
+            return aggregated_weights
 
 
 if __name__ == '__main__':
