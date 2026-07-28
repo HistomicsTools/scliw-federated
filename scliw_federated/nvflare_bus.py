@@ -3,7 +3,6 @@
 import os
 import tempfile
 import time
-import json
 
 import girder_client
 
@@ -21,7 +20,7 @@ class GirderBridge:
 
         workspace = self.gc.get('resource/lookup', parameters={'path': work_path})
         if not workspace:
-            raise FileNotFoundError(f"Girder Workspace '{work_path}' not found.")
+            raise FileNotFoundError(f"Girder Workspace '{work_path}' not found in Girder.")
 
         self.folder_id = workspace['_id']
 
@@ -33,30 +32,27 @@ class GirderBridge:
         """Poll until a specific Marker Item exists in the workspace."""
         deadline = time.time() + timeout
         
-        # Ensure we don't hammer the HTTP(S) endpoint
-        last_poll_time = 0 
         while time.time() < deadline:
-            if time.time() - last_poll_time >= poll_interval:
-                items = self._get_current_items()
-                for item in items:
-                    if item['name'] == marker_name:
-                        return True
-                
-                # If not found, enforce a pause before next HTTP request
-                time.sleep(poll_interval) 
-                last_poll_time = time.time()
-            else:
-                time.sleep(0.1)
+            items = self._get_current_items()
+            
+            for item in items:
+                if item['name'] == marker_name:
+                    return True
+            
+            time.sleep(poll_interval)
 
         return False
 
     def _create_marker_item(self, marker_name: str) -> None:
         """Create a trigger/completed marker Item in Girder."""
-        self.gc.createItem(parentFolderId=self.folder_id, name=marker_name, metadata={"type": "marker"})
+        try:
+            self.gc.createItem(parentFolderId=self.folder_id, name=marker_name, metadata={"type": "marker"})
+        except Exception as e:
+            print(f"[GirderBridge] Warning creating marker '{marker_name}': {e}")
 
     def write_task(self, round_num: int, payload):
         """Hub writes the global model (or trigger data) to Girder."""
-        task_file_name = f'model_epoch_{int(round_num)}.pt'
+        task_file_name = f'model_epoch_{round_num}.pt'
         marker_name = f'task_{round_num}_ready'
 
         tmp_dir = tempfile.mkdtemp()
@@ -80,13 +76,12 @@ class GirderBridge:
 
     def read_task(self, round_num: int):
         """Client reads the global model from Girder."""
-        task_file_name = f'model_epoch_{int(round_num)}.pt'
+        task_file_name = f'model_epoch_{round_num}.pt'
         tmp_dir = tempfile.mkdtemp()
         dest_path = os.path.join(tmp_dir, task_file_name)
 
         items = self._get_current_items()
         target_item = next((i for i in items if task_file_name in i.get('name', '')), None)
-
         if not target_item:
             return None
             
@@ -96,9 +91,10 @@ class GirderBridge:
             import torch
             return torch.load(dest_path, map_location='cpu')
 
-    def write_result(self, client_id: int, round_num: int, payload):
+    def write_result(self, client_id, round_num: int, payload):
         """Client writes its update to Girder."""
-        result_file_name = f'result_{int(client_id)}_epoch_{int(round_num)}.pt'
+        safe_client_id = str(client_id) 
+        result_file_name = f'result_{safe_client_id}_epoch_{round_num}.pt'
 
         tmp_dir = tempfile.mkdtemp()
         dest_path = os.path.join(tmp_dir, result_file_name)
@@ -108,7 +104,7 @@ class GirderBridge:
             torch.save(payload, dest_path)
         
         self.gc.uploadFileToFolder(self.folder_id, dest_path, result_file_name)
-        marker_name = f'completed_{client_id}_{round_num}'
+        marker_name = f'completed_{safe_client_id}_{round_num}'
         self._create_marker_item(marker_name)
 
     def wait_for_clients_complete(
@@ -135,11 +131,20 @@ class GirderBridge:
         """Hub reads results from all clients."""
         items = self._get_current_items()
         results = []
-
+        
+        seen = set() 
+        
         for item in items:
-            if 'result_' in item['name'] and f'epoch_{int(round_num)}' in item['name']:
+            name = item['name']
+            if 'result_' in name and f'epoch_{round_num}' in name:
+                safe_name = self.sanitize_filename(name)
+                if safe_name in seen:
+                    continue
+                seen.add(safe_name)
+
                 tmp_dir = tempfile.mkdtemp()
-                dest_path = os.path.join(tmp_dir, item['name'])
+                dest_path = os.path.join(tmp_dir, safe_name)
+                
                 files = list(self.gc.listFile(item['_id'], limit=1))
                 if files:
                     self.gc.downloadFile(files[0]['_id'], dest_path)
@@ -148,6 +153,7 @@ class GirderBridge:
         return results
 
     def write_notification(self, msg_type: str):
+        """Sends a stop signal or similar control message."""
         marker_name = f'notification_{msg_type}'
         self._create_marker_item(marker_name)
 
@@ -156,3 +162,7 @@ class GirderBridge:
         if any('notification_STOP' in item['name'] for item in items):
             return [True]
         return []
+
+    def sanitize_filename(self, filename):
+        """Sanitize filename for filesystem temporary storage."""
+        return filename.replace(',', '_').replace('\\', '_')
