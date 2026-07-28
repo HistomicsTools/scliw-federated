@@ -90,10 +90,8 @@ class FederatedCardioClient:
         import torch
         import numpy as np
         
-        # If we haven't loaded global_weights yet, we default to 21 (common UCI Cardio dim) or current X shape
-        target_dim = self.client_id if hasattr(self, 'global_weights') and 'fc1.weight' in self.global_weights else len(X[0])
-        
-        if self.local_token: # Check if client has weights from a previous round
+        target_dim = len(X[0])
+        if hasattr(self, 'global_weights') and 'fc1.weight' in self.global_weights:
              target_dim = self.global_weights['fc1.weight'].shape[1]
 
         # Pad X with zeros to the expected target dimension
@@ -116,31 +114,30 @@ class FederatedCardioClient:
     def run_loop(self, hub_token: str):
         import torch.nn as nn
 
-        current_epoch = -1
+        current_round = 0
         total_epochs = 1 # Set to 1 to prove a single epoch roundtrip completes cleanly.
         print(f"[CLIENT] Starting loop for client ID {self.client_id}.")
 
-        for current_epoch in range(total_epochs):
-            target_round = current_epoch + 1
-            marker_name = f'task_{target_round}_ready'
+        while current_round < total_epochs:
+            marker_name = f'task_{current_round}_ready'
 
             print(f"[CLIENT] Waiting for Hub broadcast '{marker_name}'...")
 
             # Poll using the bridge specifically for this round's trigger
             ready = self.girder_bridge.wait_for_task_ready(
-                round_num=target_round,
+                round_num=current_round,
                 timeout=300.0,
                 poll_interval=2.0
             )
 
             if not ready:
-                print(f"[CLIENT] Timeout waiting for epoch {target_round}!")
+                print(f"[CLIENT] Timeout waiting for epoch {current_round}!")
                 continue
 
-            global_weights = self.girder_bridge.read_task(target_round)
+            global_weights = self.girder_bridge.read_task(current_round)
 
             if global_weights is None:
-                print(f"[CLIENT] No model weights found for epoch {target_round}.")
+                print(f"[CLIENT] No model weights found for epoch {current_round}.")
                 continue
             
             # Store weights for _load_data padding logic reference if needed (or just use shape dim)
@@ -172,13 +169,14 @@ class FederatedCardioClient:
 
             updated_weights = model.state_dict()
 
-            # Write result BACK to Girder using the SAME target_round
-            print(f"[CLIENT] Uploading result for epoch {target_round}...")
+            print(f"[CLIENT] Uploading result for round {current_round}...")
             self.girder_bridge.write_result(
                 client_id=self.client_id,
-                round_num=target_round,
+                round_num=current_round,
                 payload=updated_weights
             )
+
+            current_round += 1
 
             
 
