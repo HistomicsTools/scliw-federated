@@ -4,21 +4,23 @@
 # dependencies = [
 #     'girder-client',
 #     'torch',
-#     'nvflare',
+#     'nvflare',  # NVFlare is used natively for weight aggregation math
 # ]
 # ///
 
 import argparse
 import os
 import sys
-import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
-from nvflare.app_common.shareablegenerators.full_model_shareable_generator import FullModelShareableGenerator
+# Import the bridge locally after path setup to keep top-level deps light
+from scliw_federated.nvflare_bus import GirderBridge
 
-from nvflare_bus import GirderBridge
+# Import the native NVFlare lightweight tensor aggregation math helper.
+# We use its highly optimized in-place PyTorch operations (mul/add_/div_) 
+# but bypass the heavy FLRuntime/FLContext overhead since we manage the network protocol ourselves.
+from nvflare.app_common.aggregators.weighted_aggregation_helper import WeightedAggregationHelper
 
 
 class HubCoordinator:
@@ -105,9 +107,9 @@ class HubCoordinator:
 
     def _load_client_weights(self, epoch):
         """
-        Retrieve client weights from Girder and aggregate them using NVFlare's native
-        InTimeAccumulateWeightedAggregator. This allows us to use NVFlare's logic
-        for weighted aggregation while communicating via our custom Girder polling protocol.
+        Retrieve client weights from Girder and aggregate them using NVFlare's native 
+        math library (WeightedAggregationHelper). We pass the raw PyTorch state dicts
+        directly into the helper, which handles highly optimized in-place tensor math.
         """
         print("[HUB] Fetching client updates from Girder...")
         client_results = self.girder_bridge.read_all_results(epoch)
@@ -115,30 +117,32 @@ class HubCoordinator:
         if not client_results:
             raise RuntimeError(f"No client weights found in folder for epoch {epoch}")
 
-        # Initialize NVFlare aggregation components
-        aggregator = InTimeAccumulateWeightedAggregator(expected_data_kind='WEIGHTS')
-        generator = FullModelShareableGenerator()
+        # Instantiate the native NVFlare aggregation helper.
+        # We set weigh_by_local_iter=False because we are doing standard FedAvg across epochs, 
+        # not weighted by local training steps within a single round.
+        aggregator = WeightedAggregationHelper(weigh_by_local_iter=False)
 
-        shareables_to_aggregate = []
         try:
-            print("[HUB] Wrapping weight updates into NVFlare Shareability objects...")
-            for weights_dict in client_results:
-                # Wrap the raw PyTorch state dict into an NVFlare Shareable object
-                share = generator.make_shareable(weights_dict)
-                shareables_to_aggregate.append(share)
-
-            print("[HUB] Aggregating local models using NVFlare's InTimeAccumulateWeightedAggregator...")
-            result = aggregator.aggregate(shareables_to_aggregate)
-
-            # Extract the aggregated weights from the resulting Shareable
-            new_global_state = dict(result) if hasattr(result, 'items') else result
+            print(f"[HUB] Queuing {len(client_results)} client updates for NVFlare native math...")
+            for idx, weights_dict in enumerate(client_results):
+                # Feed the raw state dict directly.
+                # Weight is 1.0 for all clients (standard FedAvg).
+                aggregator.add(
+                    data=weights_dict,
+                    weight=1.0,
+                    contributor_name=f"client_{idx}",
+                    contribution_round=epoch
+                )
+            
+            print("[HUB] Performing in-place NVFlare tensor math...")
+            new_global_state = aggregator.get_result()
             print("[HUB] Aggregation complete.")
             return new_global_state
         except Exception as e:
             import traceback
             traceback.print_exc()
-            print(f"[HUB] Error using NVFlare aggregator: {e}. Falling back to manual aggregation.")
-            # Fallback to manual averaging just in case of version incompatibilities or weird state dict issues
+            print(f"[HUB] Error using NVFlare aggregation math: {e}. Falling back to manual PyTorch averaging.")
+            # Fallback to manual averaging just in case of unexpected state dict issues or NV version conflicts
             import torch
             aggregated_weights = None
             for result in client_results:
