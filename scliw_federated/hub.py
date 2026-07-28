@@ -4,7 +4,7 @@
 # dependencies = [
 #     'girder-client',
 #     'torch',
-#     'nvflare',  # NVFlare is used natively for weight aggregation math
+#     'nvflare',
 # ]
 # ///
 
@@ -14,13 +14,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Import the bridge locally after path setup to keep top-level deps light
 from scliw_federated.nvflare_bus import GirderBridge
 
-# Import the native NVFlare lightweight tensor aggregation math helper.
-# We use its highly optimized in-place PyTorch operations (mul/add_/div_) 
-# but bypass the heavy FLRuntime/FLContext overhead since we manage the network protocol ourselves.
-from nvflare.app_common.aggregators.weighted_aggregation_helper import WeightedAggregationHelper
+# Explicitly import NVFlare federated learning components for model aggregation
+from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
+from nvflare.apis.fl_context import FLContext
+from nvflare.apis.shareable import Shareable, ShareableKey
 
 
 class HubCoordinator:
@@ -28,37 +27,35 @@ class HubCoordinator:
         self.work_path = work_path
         self.epochs = int(epochs)
         self.num_clients = int(num_clients)
-        self.girder_url = None  # Initialized in _init_components
-        self.gc = None
+        self.girder_url = None
         self.workspace = None
         self.folder_id = None
-        self.girder_bridge = None
+        
+        # Initialize NVFlare's federated aggregator component for model aggregation
+        self.nvflare_aggregator = InTimeAccumulateWeightedAggregator()
 
     def _init_components(self, girder_token: str):
         import girder_client
 
-        # Initialize Girder client
         self.gc = girder_client.GirderClient(apiUrl=self.girder_url)
         self.gc.token = girder_token
 
-        # Verify Hub Workspace
         self.workspace = self.gc.get('resource/lookup', parameters={'path': self.work_path})
         if not self.workspace:
             raise FileNotFoundError(f"Hub workspace '{self.work_path}' not found in Girder.")
 
         self.folder_id = self.workspace['_id']
-
-        # Initialize the NVFlare Girder Bridge using explicit authentication (no env fallbacks)
+        
+        # Initialize the NVFlare Girder Bridge using explicit authentication (transport layer)
         self.girder_bridge = GirderBridge(
             girder_url=self.girder_url,
             girder_token=girder_token,
             work_path=self.work_path
         )
 
-    def run(self, girder_token):
+    def run(self, girder_token: str):
         import torch
 
-        # Ensure components are initialized with the provided hub token
         if not self.girder_bridge:
             self._init_components(girder_token)
 
@@ -74,6 +71,7 @@ class HubCoordinator:
             'fc3.bias': torch.zeros(2)
         }
 
+        # Send initial global state via Girder transport
         self.girder_bridge.write_task(round_num=0, payload=initial_weights)
 
         for epoch in range(self.epochs):
@@ -95,8 +93,31 @@ class HubCoordinator:
             if not completed:
                 print(f'[HUB] Warning: Not all clients responded for epoch {epoch + 1}')
 
-            # Aggregate weights via Girder Bridge protocol
-            new_global_state = self._load_client_weights(epoch)
+            # Load client weights retrieved via Girder file transfer
+            client_raw_weights = self.girder_bridge.read_all_results(epoch)
+
+            if not client_raw_weights:
+                raise RuntimeError(f"No client weights found in folder for epoch {epoch}")
+
+            # Delegate model aggregation to the NVFlare Aggregator component
+            # Wrap raw tensors into standardized FL shares
+            shareable_list = []
+            for idx, w_dict in enumerate(client_raw_weights):
+                share = Shareable()
+                share.set_shareable_key(ShareableKey.AGGREGATION_INDEX, str(idx))
+                share.set_data(key="WEIGHTS", data=w_dict)
+                shareable_list.append(share)
+
+            fl_ctx = FLContext()
+            
+            # Pass shares to NVFlare's federated averaging logic explicitly
+            aggregated_share = self.nvflare_aggregator.aggregate(
+                num_epochs=1, 
+                flctx=fl_ctx, 
+                result_shareables=shareable_list
+            )
+
+            new_global_state = aggregated_share.get_data("WEIGHTS")
 
             try:
                 self.girder_bridge.write_task(round_num=int(epoch) + 1, payload=new_global_state)
@@ -104,56 +125,6 @@ class HubCoordinator:
                 print(f"[HUB] Error writing aggregated weights: {e}")
 
         print('[HUB] Federated learning completed successfully.')
-
-    def _load_client_weights(self, epoch):
-        """
-        Retrieve client weights from Girder and aggregate them using NVFlare's native 
-        math library (WeightedAggregationHelper). We pass the raw PyTorch state dicts
-        directly into the helper, which handles highly optimized in-place tensor math.
-        """
-        print("[HUB] Fetching client updates from Girder...")
-        client_results = self.girder_bridge.read_all_results(epoch)
-
-        if not client_results:
-            raise RuntimeError(f"No client weights found in folder for epoch {epoch}")
-
-        # Instantiate the native NVFlare aggregation helper.
-        # We set weigh_by_local_iter=False because we are doing standard FedAvg across epochs, 
-        # not weighted by local training steps within a single round.
-        aggregator = WeightedAggregationHelper(weigh_by_local_iter=False)
-
-        try:
-            print(f"[HUB] Queuing {len(client_results)} client updates for NVFlare native math...")
-            for idx, weights_dict in enumerate(client_results):
-                # Feed the raw state dict directly.
-                # Weight is 1.0 for all clients (standard FedAvg).
-                aggregator.add(
-                    data=weights_dict,
-                    weight=1.0,
-                    contributor_name=f"client_{idx}",
-                    contribution_round=epoch
-                )
-            
-            print("[HUB] Performing in-place NVFlare tensor math...")
-            new_global_state = aggregator.get_result()
-            print("[HUB] Aggregation complete.")
-            return new_global_state
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"[HUB] Error using NVFlare aggregation math: {e}. Falling back to manual PyTorch averaging.")
-            # Fallback to manual averaging just in case of unexpected state dict issues or NV version conflicts
-            import torch
-            aggregated_weights = None
-            for result in client_results:
-                if aggregated_weights is None:
-                    aggregated_weights = {k: v.clone() * 0.0 for k, v in result.items()}
-                for key in aggregated_weights.keys():
-                    if key in result:
-                        aggregated_weights[key].add_(result[key])
-            for key in aggregated_weights.keys():
-                aggregated_weights[key] /= len(client_results)
-            return aggregated_weights
 
 
 if __name__ == '__main__':
@@ -167,19 +138,16 @@ if __name__ == '__main__':
     parser.add_argument('--work-path', required=True,
                         help='Hub Girder path to work folder')
     parser.add_argument('--epochs', type=int, default=3,
-                        help='Number of epochs to run')
+                        help="Number of epochs to run")
     parser.add_argument('--clients', type=int, default=4,
                         help="Number of clients to expect for aggregation")
 
     args = parser.parse_args()
 
-    # Initialize the Hub Coordinator with workspace resolution immediately to ensure path exists
     hub = HubCoordinator(
         girder_url=args.girder_url,
         work_path=args.work_path,
         epochs=args.epochs,
         num_clients=args.clients
     )
-    hub.girder_url = args.girder_url
-
     hub.run(args.girder_token)
