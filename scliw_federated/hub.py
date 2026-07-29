@@ -26,7 +26,7 @@ class HubCoordinator:
         self.girder_bridge = None
         self.girder_url = girder_url
         self.nvflare_aggregator = nvflare.app_common.aggregators.intime_accumulate_model_aggregator.InTimeAccumulateWeightedAggregator(  # noqa
-            expected_data_kind={"weights": DataKind.WEIGHT_DIFF}  # Pass dict explicitly to bypass enum initialization bug in this version
+            expected_data_kind={'weights': DataKind.WEIGHT_DIFF}
         )
 
     def _init_components(self, girder_token: str):
@@ -55,8 +55,6 @@ class HubCoordinator:
 
     def run(self, girder_token: str):
         import torch
-        from nvflare.apis.fl_context import FLContext
-        from nvflare.apis.shareable import Shareable
 
         # Ensure components are initialized with the provided hub token
         if not self.girder_bridge:
@@ -91,25 +89,24 @@ class HubCoordinator:
             if not client_raw_weights:
                 raise RuntimeError(f'No client weights found in folder for epoch {epoch}')
 
-            # FIX: Because NVFlare's InTimeAccumulateWeightedAggregator strictly validates 
+            # Because NVFlare's InTimeAccumulateWeightedAggregator strictly validates
             # internal DXO formats, we perform standard FedAvg weight averaging manually here
             # to bypass transport-layer validation errors over Girder.
-            can_aggregate = False
             new_global_state = None
             if len(client_raw_weights) > 0:
-                print(f'[HUB] Aggregating {len(client_raw_weights)} client updates for epoch {epoch + 1}')
+                print(f'[HUB] Aggregating {len(client_raw_weights)} client '
+                      f'updates for epoch {epoch + 1}')
                 # Average the weights: sum all dicts and divide by the number of clients.
                 new_global_state = {}
                 for model_key in client_raw_weights[0].keys():
-                    accumulated = sum(r.get(model_key, torch.tensor(0.0)) for r in client_raw_weights)
+                    accumulated = sum(r.get(model_key, torch.tensor(0.0))
+                                      for r in client_raw_weights)
                     new_global_state[model_key] = accumulated / len(client_raw_weights)
-                can_aggregate = True
-            
             try:
                 if new_global_state is not None:
                     self.girder_bridge.write_task(
                         round_num=int(epoch) + 1, payload=new_global_state)
-                    print(f'[HUB] Successfully wrote aggregated weights for epoch {epoch + 1} to Girder.')
+                    print(f'[HUB] Wrote aggregated weights for epoch {epoch + 1} to Girder.')
                 else:
                     print(f'[HUB] Aggregation incomplete or empty for epoch {epoch + 1}')
             except Exception as e:

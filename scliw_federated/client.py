@@ -3,10 +3,9 @@
 # requires-python = '>=3.10'
 # dependencies = [
 #     'girder-client',
-#     'torch',
 #     'pandas',
 #     'scikit-learn',
-#     'nvflare',
+#     'torch',
 # ]
 # ///
 
@@ -104,7 +103,6 @@ class FederatedCardioClient:
 
     def run_loop(self):
         import torch.nn as nn
-        from nvflare.apis.shareable import Shareable
 
         current_round = 0
         total_epochs = 100

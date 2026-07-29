@@ -18,11 +18,9 @@ class GirderBridge:
         self.base_dir = work_path
         self.gc = girder_client.GirderClient(apiUrl=girder_url)
         self.gc.token = girder_token
-
         workspace = self.gc.get('resource/lookup', parameters={'path': work_path})
         if not workspace:
             raise FileNotFoundError(f"Girder Workspace '{work_path}' not found in Girder.")
-
         self.folder_id = workspace['_id']
 
     def _get_current_items(self) -> list:
@@ -33,7 +31,6 @@ class GirderBridge:
                          poll_interval: float = 2.0) -> bool:
         """Poll until a specific Marker Item exists in the workspace."""
         deadline = time.time() + timeout
-
         while time.time() < deadline:
             items = self._get_current_items()
 
@@ -42,7 +39,6 @@ class GirderBridge:
                     return True
 
             time.sleep(poll_interval)
-
         return False
 
     def _create_marker_item(self, marker_name: str) -> None:
@@ -55,20 +51,18 @@ class GirderBridge:
 
     def write_task(self, round_num: int, payload):
         """Hub writes the global model (or trigger data) to Girder."""
+        import torch
+
         task_file_name = f'model_epoch_{round_num}.pt'
         marker_name = f'task_{round_num}_ready'
-
         tmp_dir = tempfile.mkdtemp()
         source_path = os.path.join(tmp_dir, task_file_name)
-
-        import torch
         if isinstance(payload, dict):
             torch.save(payload, source_path)
         else:
             with open(source_path, 'wb') as f:
                 import pickle
                 pickle.dump(payload, f)
-
         self.gc.uploadFileToFolder(self.folder_id, source_path, task_file_name)
         # Verify the file is actually visible in Girder before signaling readiness
         items = list(self.gc.listItem(self.folder_id))
@@ -90,7 +84,6 @@ class GirderBridge:
         target_item = next((i for i in items if task_file_name in i.get('name', '')), None)
         if not target_item:
             return None
-
         files = list(self.gc.listFile(target_item['_id'], limit=1))
         if files:
             self.gc.downloadFile(files[0]['_id'], dest_path)
@@ -99,16 +92,14 @@ class GirderBridge:
 
     def write_result(self, client_id, round_num: int, payload):
         """Client writes its update to Girder."""
+        import torch
+
         safe_client_id = str(client_id)
         result_file_name = f'result_{safe_client_id}_epoch_{round_num}.pt'
-
         tmp_dir = tempfile.mkdtemp()
         dest_path = os.path.join(tmp_dir, result_file_name)
-
-        import torch
         if isinstance(payload, dict):
             torch.save(payload, dest_path)
-
         self.gc.uploadFileToFolder(self.folder_id, dest_path, result_file_name)
         # Verify the file is actually visible in Girder before signaling completion
         items = list(self.gc.listItem(self.folder_id))
@@ -141,9 +132,7 @@ class GirderBridge:
         """Hub reads results from all clients."""
         items = self._get_current_items()
         results = []
-
         seen = set()
-
         for item in items:
             name = item['name']
             if 'result_' in name and f'epoch_{round_num}.' in name:
@@ -151,16 +140,14 @@ class GirderBridge:
                 if safe_name in seen:
                     continue
                 seen.add(safe_name)
-
                 tmp_dir = tempfile.mkdtemp()
                 dest_path = os.path.join(tmp_dir, safe_name)
-
                 files = list(self.gc.listFile(item['_id'], limit=1))
                 if files:
-                    self.gc.downloadFile(files[0]['_id'], dest_path)
                     import torch
+
+                    self.gc.downloadFile(files[0]['_id'], dest_path)
                     loaded_data = torch.load(dest_path, map_location='cpu')
-                    # Guard against async replication returning empty/corrupted files
                     if loaded_data is not None:
                         results.append(loaded_data)
                         print(f'read {name}')
