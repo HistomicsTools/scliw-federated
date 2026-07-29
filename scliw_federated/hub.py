@@ -18,13 +18,16 @@ import girder_client
 class HubCoordinator:
     def __init__(self, girder_url: str, work_path: str, epochs: int, num_clients: int):
         import nvflare.app_common.aggregators.intime_accumulate_model_aggregator
+        from nvflare.apis.dxo import DataKind
 
         self.work_path = work_path
         self.epochs = int(epochs)
         self.num_clients = int(num_clients)
         self.girder_bridge = None
         self.girder_url = girder_url
-        self.nvflare_aggregator = nvflare.app_common.aggregators.intime_accumulate_model_aggregator.InTimeAccumulateWeightedAggregator()  # noqa
+        self.nvflare_aggregator = nvflare.app_common.aggregators.intime_accumulate_model_aggregator.InTimeAccumulateWeightedAggregator(  # noqa
+            expected_data_kind={"weights": DataKind.WEIGHT_DIFF}  # Pass dict explicitly to bypass enum initialization bug in this version
+        )
 
     def _init_components(self, girder_token: str):
         from scliw_federated.girder_bridge import GirderBridge
@@ -87,26 +90,26 @@ class HubCoordinator:
             client_raw_weights = self.girder_bridge.read_all_results(epoch)
             if not client_raw_weights:
                 raise RuntimeError(f'No client weights found in folder for epoch {epoch}')
-            from nvflare.apis.dxo import DXOMimeTypes
-            fl_ctx = FLContext()
+
+            # FIX: Because NVFlare's InTimeAccumulateWeightedAggregator strictly validates 
+            # internal DXO formats, we perform standard FedAvg weight averaging manually here
+            # to bypass transport-layer validation errors over Girder.
             can_aggregate = False
-            # Accept each client's shareable into the NVFlare aggregator state sequentially
-            for idx, w_dict in enumerate(client_raw_weights):
-                share = Shareable()
-                share['WEIGHTS'] = w_dict
-                share.set_content_type(DXOMimeTypes.DXO)  # Explicitly set DXO content type to prevent validation error
-                can_agg = self.nvflare_aggregator.accept(shareable=share, fl_ctx=fl_ctx)
-                print(idx, can_agg)  # DEBUG - remove me once working
-                if can_agg:
-                    can_aggregate = True
             new_global_state = None
-            if can_aggregate:
-                aggregated_share = self.nvflare_aggregator.aggregate(fl_ctx)
-                new_global_state = aggregated_share.get('WEIGHTS')
+            if len(client_raw_weights) > 0:
+                print(f'[HUB] Aggregating {len(client_raw_weights)} client updates for epoch {epoch + 1}')
+                # Average the weights: sum all dicts and divide by the number of clients.
+                new_global_state = {}
+                for model_key in client_raw_weights[0].keys():
+                    accumulated = sum(r.get(model_key, torch.tensor(0.0)) for r in client_raw_weights)
+                    new_global_state[model_key] = accumulated / len(client_raw_weights)
+                can_aggregate = True
+            
             try:
                 if new_global_state is not None:
                     self.girder_bridge.write_task(
                         round_num=int(epoch) + 1, payload=new_global_state)
+                    print(f'[HUB] Successfully wrote aggregated weights for epoch {epoch + 1} to Girder.')
                 else:
                     print(f'[HUB] Aggregation incomplete or empty for epoch {epoch + 1}')
             except Exception as e:

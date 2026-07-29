@@ -158,7 +158,8 @@ class GirderBridge:
                 files = list(self.gc.listFile(item['_id'], limit=1))
                 if files:
                     self.gc.downloadFile(files[0]['_id'], dest_path)
-                    loaded_data = torch_module.load(dest_path, map_location='cpu')
+                    import torch
+                    loaded_data = torch.load(dest_path, map_location='cpu')
                     # Guard against async replication returning empty/corrupted files
                     if loaded_data is not None:
                         results.append(loaded_data)
