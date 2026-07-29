@@ -12,36 +12,36 @@ import argparse
 import os
 import sys
 
+import girder_client
+
 
 class HubCoordinator:
     def __init__(self, girder_url: str, work_path: str, epochs: int, num_clients: int):
+        import nvflare.app_common.aggregators.intime_accumulate_model_aggregator
+
         self.work_path = work_path
         self.epochs = int(epochs)
         self.num_clients = int(num_clients)
-        self.girder_url = None
+        self.girder_bridge = None
+        self.girder_url = girder_url
 
         # Initialize NVFlare's federated aggregator component for model aggregation
-        from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
-        self.nvflare_aggregator = InTimeAccumulateWeightedAggregator()
+        self.nvflare_aggregator = nvflare.app_common.aggregators.intime_accumulate_model_aggregator.InTimeAccumulateWeightedAggregator()  # noqa
 
     def _init_components(self, girder_token: str):
-        import girder_client
-        from scliw_federated.nvflare_bus import GirderBridge
-
-        self.girder_url = "http://localhost:8080/api/v1" # Default fallback logic if needed later
+        from scliw_federated.girder_bridge import GirderBridge
 
         self.gc = girder_client.GirderClient(apiUrl=self.girder_url)
         self.gc.token = girder_token
 
         workspace = self.gc.get('resource/lookup', parameters={'path': self.work_path})
         if not workspace:
-            from pathlib import Path
             # Handle local testing file path fallback if Girder lookup fails but it's a real dir
             if os.path.exists(self.work_path):
-                print(f"[HUB] Warning: Workspace '{self.work_path}' not in Girder, treating as local path.")
-                self.folder_id = None # Use local logic if applicable
+                self.folder_id = None
             else:
-                raise FileNotFoundError(f"Hub workspace '{self.work_path}' not found in Girder or file system.")
+                raise FileNotFoundError(
+                    f'Hub workspace {self.work_path} not found in Girder or file system.')
 
         self.folder_id = workspace.get('_id')
 
@@ -56,13 +56,13 @@ class HubCoordinator:
         import torch
         from nvflare.apis.fl_context import FLContext
         from nvflare.apis.shareable import Shareable
-        from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
 
         # Ensure components are initialized with the provided hub token
         if not self.girder_bridge:
             self._init_components(girder_token)
 
-        print(f'[HUB] Starting federated training with {self.epochs} epochs and {self.num_clients} clients.')
+        print(f'[HUB] Starting federated training with {self.epochs} epochs '
+              f'and {self.num_clients} clients.')
 
         default_feat_size = 11
         initial_weights = {
@@ -100,7 +100,7 @@ class HubCoordinator:
             client_raw_weights = self.girder_bridge.read_all_results(epoch)
 
             if not client_raw_weights:
-                raise RuntimeError(f"No client weights found in folder for epoch {epoch}")
+                raise RuntimeError(f'No client weights found in folder for epoch {epoch}')
 
             # Delegate model aggregation to the NVFlare Aggregator component
             # Wrap raw tensors into standardized FL shares
@@ -108,7 +108,7 @@ class HubCoordinator:
             for idx, w_dict in enumerate(client_raw_weights):
                 share = Shareable()
                 share.set_shareable_key(ShareableKey.AGGREGATION_INDEX, str(idx))
-                share.set_data(key="WEIGHTS", data=w_dict)
+                share.set_data(key='WEIGHTS', data=w_dict)
                 shareable_list.append(share)
 
             fl_ctx = FLContext()
@@ -120,20 +120,20 @@ class HubCoordinator:
                 result_shareables=shareable_list
             )
 
-            new_global_state = aggregated_share.get_data("WEIGHTS")
+            new_global_state = aggregated_share.get_data('WEIGHTS')
 
             try:
                 self.girder_bridge.write_task(round_num=int(epoch) + 1, payload=new_global_state)
             except Exception as e:
-                print(f"[HUB] Error writing aggregated weights: {e}")
+                print(f'[HUB] Error writing aggregated weights: {e}')
 
         print('[HUB] Federated learning completed successfully.')
 
 
 if __name__ == '__main__':
-    here = os.path.abspath(os.path.dirname(os.path.abspath(__file__)))
-    if here not in sys.path:
-        sys.path.insert(0, here)
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
     parser = argparse.ArgumentParser()
     parser.add_argument('--girder-url', default='http://localhost:8080/api/v1',
                         help='Hub Girder URL')

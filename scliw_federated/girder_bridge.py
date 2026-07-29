@@ -9,8 +9,9 @@ import girder_client
 
 class GirderBridge:
     """
-    A bridge implementation that routes artifact transfer via a Girder workspace folder.
-    Replaces the standard FLARE FileTransfer mechanism with a polling-based Girder interface.
+    A bridge implementation that routes artifact transfer via a Girder
+    workspace folder.  Replaces the standard FLARE FileTransfer mechanism
+    with a polling-based Girder interface.
     """
 
     def __init__(self, girder_url: str, girder_token: str, work_path: str):
@@ -28,7 +29,8 @@ class GirderBridge:
         """Helper to get a fresh list of items from Girder."""
         return list(self.gc.listItem(self.folder_id))
 
-    def _wait_for_marker(self, marker_name: str, timeout: float = 300.0, poll_interval: float = 2.0) -> bool:
+    def _wait_for_marker(self, marker_name: str, timeout: float = 300.0,
+                         poll_interval: float = 2.0) -> bool:
         """Poll until a specific Marker Item exists in the workspace."""
         deadline = time.time() + timeout
 
@@ -46,7 +48,8 @@ class GirderBridge:
     def _create_marker_item(self, marker_name: str) -> None:
         """Create a trigger/completed marker Item in Girder."""
         try:
-            self.gc.createItem(parentFolderId=self.folder_id, name=marker_name, metadata={"type": "marker"})
+            self.gc.createItem(
+                parentFolderId=self.folder_id, name=marker_name, metadata={'type': 'marker'})
         except Exception as e:
             print(f"[GirderBridge] Warning creating marker '{marker_name}': {e}")
 
@@ -120,7 +123,7 @@ class GirderBridge:
             completed_count = 0
             for item in items:
                 name = item['name']
-                if f'completed_' in name and name.endswith(f'_{round_num}'):
+                if 'completed_' in name and name.endswith(f'_{round_num}'):
                     completed_count += 1
 
             if completed_count < total_clients:
