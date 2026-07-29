@@ -60,10 +60,8 @@ class HubCoordinator:
         # Ensure components are initialized with the provided hub token
         if not self.girder_bridge:
             self._init_components(girder_token)
-
         print(f'[HUB] Starting federated training with {self.epochs} epochs '
               f'and {self.num_clients} clients.')
-
         default_feat_size = 11
         initial_weights = {
             'fc1.weight': torch.zeros(64, default_feat_size),
@@ -73,18 +71,13 @@ class HubCoordinator:
             'fc3.weight': torch.zeros(2, 32),
             'fc3.bias': torch.zeros(2)
         }
-
         # Send initial global state via Girder transport (using bridge for polling/triggering)
         self.girder_bridge.write_task(round_num=0, payload=initial_weights)
-
         for epoch in range(self.epochs):
-            print(f'--- Coordinating Epoch {epoch + 1}/{self.epochs} ---')
-
+            print(f'Coordinating Epoch {epoch + 1}/{self.epochs}')
             # Create trigger marker item via the bridge's synchronous poll mechanism
             self.girder_bridge._create_marker_item(f'trigger_{int(epoch)}')
-
             print(f'[HUB] Waiting for {self.num_clients} workers to complete round {epoch + 1}')
-
             # Wait for clients via Girder Bridge protocol with explicit HTTP polling
             completed = self.girder_bridge.wait_for_clients_complete(
                 round_num=int(epoch),
@@ -92,41 +85,30 @@ class HubCoordinator:
                 timeout=600.0,
                 poll_interval=2.0
             )
-
             if not completed:
                 print(f'[HUB] Warning: Not all clients responded for epoch {epoch + 1}')
-
             # Load client weights retrieved via Girder file transfer
             client_raw_weights = self.girder_bridge.read_all_results(epoch)
-
             if not client_raw_weights:
                 raise RuntimeError(f'No client weights found in folder for epoch {epoch}')
-
             # Delegate model aggregation to the NVFlare Aggregator component
             # Wrap raw tensors into standardized FL shares
             shareable_list = []
-            for idx, w_dict in enumerate(client_raw_weights):
+            for _, w_dict in enumerate(client_raw_weights):
                 share = Shareable()
-                share.set_shareable_key(ShareableKey.AGGREGATION_INDEX, str(idx))
-                share.set_data(key='WEIGHTS', data=w_dict)
+                share['WEIGHTS'] = w_dict
                 shareable_list.append(share)
-
             fl_ctx = FLContext()
-
             # Pass shares to NVFlare's federated averaging logic explicitly
             aggregated_share = self.nvflare_aggregator.aggregate(
-                num_epochs=1,
-                flctx=fl_ctx,
+                fl_ctx=fl_ctx,
                 result_shareables=shareable_list
             )
-
             new_global_state = aggregated_share.get_data('WEIGHTS')
-
             try:
                 self.girder_bridge.write_task(round_num=int(epoch) + 1, payload=new_global_state)
             except Exception as e:
                 print(f'[HUB] Error writing aggregated weights: {e}')
-
         print('[HUB] Federated learning completed successfully.')
 
 

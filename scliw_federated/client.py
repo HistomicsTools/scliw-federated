@@ -115,7 +115,7 @@ class FederatedCardioClient:
             print(f'[CLIENT] Waiting for Hub broadcast {marker_name}')
             ready = self.girder_bridge.wait_for_task_ready(
                 round_num=current_round,
-                timeout=300.0,
+                timeout=3600.0,
                 poll_interval=2.0
             )
             if not ready:
@@ -159,7 +159,7 @@ class FederatedCardioClient:
             print(f'[CLIENT] Uploading result for round {current_round}')
             update_share = Shareable()
             # Use a standard key; NVFlare's aggregator will handle it via AGG_INDEX or list order
-            update_share.set_data(key='WEIGHTS', data=updated_weights)
+            update_share['WEIGHTS'] = updated_weights
 
             self.girder_bridge.write_result(
                 client_id=self.client_id,
