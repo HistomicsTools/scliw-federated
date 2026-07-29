@@ -24,8 +24,6 @@ class HubCoordinator:
         self.num_clients = int(num_clients)
         self.girder_bridge = None
         self.girder_url = girder_url
-
-        # Initialize NVFlare's federated aggregator component for model aggregation
         self.nvflare_aggregator = nvflare.app_common.aggregators.intime_accumulate_model_aggregator.InTimeAccumulateWeightedAggregator()  # noqa
 
     def _init_components(self, girder_token: str):
@@ -91,22 +89,26 @@ class HubCoordinator:
             client_raw_weights = self.girder_bridge.read_all_results(epoch)
             if not client_raw_weights:
                 raise RuntimeError(f'No client weights found in folder for epoch {epoch}')
-            # Delegate model aggregation to the NVFlare Aggregator component
-            # Wrap raw tensors into standardized FL shares
-            shareable_list = []
-            for _, w_dict in enumerate(client_raw_weights):
+            fl_ctx = FLContext()
+            can_aggregate = False
+            # Accept each client's shareable into the NVFlare aggregator state sequentially
+            for idx, w_dict in enumerate(client_raw_weights):
                 share = Shareable()
                 share['WEIGHTS'] = w_dict
-                shareable_list.append(share)
-            fl_ctx = FLContext()
-            # Pass shares to NVFlare's federated averaging logic explicitly
-            aggregated_share = self.nvflare_aggregator.aggregate(
-                fl_ctx=fl_ctx,
-                result_shareables=shareable_list
-            )
-            new_global_state = aggregated_share.get_data('WEIGHTS')
+                can_agg = self.nvflare_aggregator.accept(shareable=share, fl_ctx=fl_ctx)
+                print(idx, can_agg)  # DEBUG - remove me once working
+                if can_agg:
+                    can_aggregate = True
+            new_global_state = None
+            if can_aggregate:
+                aggregated_share = self.nvflare_aggregator.aggregate(fl_ctx)
+                new_global_state = aggregated_share.get('WEIGHTS')
             try:
-                self.girder_bridge.write_task(round_num=int(epoch) + 1, payload=new_global_state)
+                if new_global_state is not None:
+                    self.girder_bridge.write_task(
+                        round_num=int(epoch) + 1, payload=new_global_state)
+                else:
+                    print(f'[HUB] Aggregation incomplete or empty for epoch {epoch + 1}')
             except Exception as e:
                 print(f'[HUB] Error writing aggregated weights: {e}')
         print('[HUB] Federated learning completed successfully.')
