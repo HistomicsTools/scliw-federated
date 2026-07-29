@@ -130,39 +130,38 @@ if __name__ == '__main__':
                         help='Number of epochs to run')
     parser.add_argument('--clients', type=int, default=4,
                         help='Number of clients to expect for aggregation')
-    parser.add_argument('--reset', action='store_true',
-                        help='Rename current work-path folder (if non-empty) and create a new one')
+    parser.add_argument(
+        '--reset', action='store_true',
+        help='Rename current work-path folder (if non-empty) and create a new one in Girder')
     args = parser.parse_args()
-    # Handle --reset argument
-    if args.reset and os.path.isdir(args.work_path):
-        contents = [x for x in os.listdir(args.work_path) if x not in ('.', '..')]
-        if len(contents) > 0:
-            stat_info = os.stat(args.work_path)
-            try:
-                birth_time = stat_info.st_birthtime
-            except AttributeError:
-                # st_ctime on Linux is metadata change time, use it as a fallback for creation time
-                birth_time = stat_info.st_ctime
-            dt_obj = datetime.datetime.fromtimestamp(birth_time, tz=datetime.timezone.utc)
-            formatted_dt = dt_obj.strftime('%Y%m%d-%H%M%S')
-            
-            parent_dir = os.path.dirname(args.work_path)
-            base_name = os.path.basename(args.work_path)
-            new_name = f"{base_name} {formatted_dt}"
-            new_path = os.path.join(parent_dir, new_name)
-            
-            try:
-                os.rename(args.work_path, new_path)
-                print(f'[HUB] Renamed existing non-empty workspace to {new_path}')
-            except Exception as e:
-                print(f'[HUB] Failed to rename workspace: {e}')
-        else:
-            print('[HUB] Workspace is empty, skipping rename as requested.')
-
-    # Ensure work_path exists for the new session if it was deleted/renamed or just created
-    if not os.path.exists(args.work_path):
-        os.makedirs(args.work_path)
-
+    if args.reset:
+        gc = girder_client.GirderClient(apiUrl=args.girder_url)
+        gc.token = args.girder_token
+        try:
+            workspace = gc.get('resource/lookup', parameters={'path': args.work_path})
+            if workspace:
+                if sum(1 for _ in gc.listItem(workspace['_id'], limit=1)):
+                    ts = None
+                    dt_obj = datetime.datetime.now(datetime.timezone.utc)
+                    try:
+                        dt_obj = datetime.datetime.strptime(
+                            workspace['created'].replace('Z', '+00:00'),
+                            '%Y-%m-%dT%H:%M:%S.%f+00:00'
+                        )
+                    except Exception:
+                        pass
+                    formatted_dt = dt_obj.strftime('%Y%m%d-%H%M%S')
+                    new_name = f'{workspace["name"]} {formatted_dt}'
+                    gc.put(f'folder/{workspace["_id"]}', {'name': new_name})
+                if 'parentId' in workspace:
+                    new_folder = gc.createFolder(
+                        parentId=workspace['parentId'],
+                        name=workspace['name'],
+                        parentType=workspace['parentCollection'],
+                    )
+        except Exception:
+            raise
+            print('[HUB] Could not reset folder')
     hub = HubCoordinator(
         girder_url=args.girder_url,
         work_path=args.work_path,
