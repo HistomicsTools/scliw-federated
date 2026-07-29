@@ -30,8 +30,15 @@
       <label>Clients</label>
       <longflag>clients</longflag>
       <description>Number of clients to expect</description>
-      <default>4</default>
+      <default>3</default>
     </integer>
+    <boolean>
+      <name>reset</name>
+      <longflag>reset</longflag>
+      <description>Reset data on start of the task</description>
+      <label>Reset</label>
+      <default>true</default>
+    </boolean>    
   </parameters>
   <!-- These are used to allow sending annotations directly to girder -->
   <parameters advanced="true">

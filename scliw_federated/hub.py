@@ -132,10 +132,10 @@ if __name__ == '__main__':
     parser.add_argument('--clients', type=int, default=4,
                         help='Number of clients to expect for aggregation')
     parser.add_argument(
-        '--reset', action='store_true',
+        '--reset', choices=['false', 'true'], default='false',
         help='Rename current work-path folder (if non-empty) and create a new one in Girder')
     args = parser.parse_args()
-    if args.reset:
+    if str(args.reset).lower().startswith('t'):
         gc = girder_client.GirderClient(apiUrl=args.girder_url)
         gc.token = args.girder_token
         try:
