@@ -30,7 +30,7 @@ class HubCoordinator:
             expected_data_kind={'weights': DataKind.WEIGHT_DIFF}
         )
 
-    def _init_components(self, girder_token: str):
+    def init_components(self, girder_token: str):
         from scliw_federated.girder_bridge import GirderBridge
 
         self.gc = girder_client.GirderClient(apiUrl=self.girder_url)
@@ -59,7 +59,7 @@ class HubCoordinator:
 
         # Ensure components are initialized with the provided hub token
         if not self.girder_bridge:
-            self._init_components(girder_token)
+            self.init_components(girder_token)
         print(f'[HUB] Starting federated training with {self.epochs} epochs '
               f'and {self.num_clients} clients.')
         default_feat_size = 11
@@ -113,6 +113,7 @@ class HubCoordinator:
             except Exception as e:
                 print(f'[HUB] Error writing aggregated weights: {e}')
         print('[HUB] Federated learning completed successfully.')
+        self.girder_bridge.write_done()
 
 
 if __name__ == '__main__':

@@ -23,31 +23,35 @@ class GirderBridge:
             raise FileNotFoundError(f"Girder Workspace '{work_path}' not found in Girder.")
         self.folder_id = workspace['_id']
 
-    def _get_current_items(self) -> list:
+    def get_current_items(self) -> list:
         """Helper to get a fresh list of items from Girder."""
         return list(self.gc.listItem(self.folder_id))
 
-    def _wait_for_marker(self, marker_name: str, timeout: float = 300.0,
-                         poll_interval: float = 2.0) -> bool:
+    def wait_for_marker(self, marker: str | list, timeout: float = 300.0,
+                         poll_interval: float = 2.0) -> bool | str:
         """Poll until a specific Marker Item exists in the workspace."""
+        marker_list = [marker] if isinstance(marker, str) else marker
         deadline = time.time() + timeout
         while time.time() < deadline:
-            items = self._get_current_items()
+            items = self.get_current_items()
 
             for item in items:
-                if item['name'] == marker_name:
-                    return True
+                if item['name'] in marker_list:
+                    return item['name']
 
             time.sleep(poll_interval)
         return False
 
-    def _create_marker_item(self, marker_name: str) -> None:
+    def create_marker_item(self, marker_name: str) -> None:
         """Create a trigger/completed marker Item in Girder."""
         try:
             self.gc.createItem(
                 parentFolderId=self.folder_id, name=marker_name, metadata={'type': 'marker'})
         except Exception as e:
             print(f"[GirderBridge] Warning creating marker '{marker_name}': {e}")
+
+    def write_done(self):
+        self.create_marker_item('task_done')
 
     def write_task(self, round_num: int, payload):
         """Hub writes the global model (or trigger data) to Girder."""
@@ -67,12 +71,11 @@ class GirderBridge:
         # Verify the file is actually visible in Girder before signaling readiness
         items = list(self.gc.listItem(self.folder_id))
         if any(item['name'] == task_file_name for item in items):
-            self._create_marker_item(marker_name)
+            self.create_marker_item(marker_name)
 
-    def wait_for_task_ready(self, round_num: int, timeout=300.0, poll_interval=2.0) -> bool:
+    def wait_for_task_ready(self, marker: str, done_marker: str, timeout=300.0, poll_interval=2.0) -> bool | str:
         """Clients poll until the Hub has uploaded the task for a specific round."""
-        marker = f'task_{round_num}_ready'
-        return self._wait_for_marker(marker, timeout, poll_interval)
+        return self.wait_for_marker([marker, done_marker], timeout, poll_interval)
 
     def read_task(self, round_num: int):
         """Client reads the global model from Girder."""
@@ -80,7 +83,7 @@ class GirderBridge:
         tmp_dir = tempfile.mkdtemp()
         dest_path = os.path.join(tmp_dir, task_file_name)
 
-        items = self._get_current_items()
+        items = self.get_current_items()
         target_item = next((i for i in items if task_file_name in i.get('name', '')), None)
         if not target_item:
             return None
@@ -105,7 +108,7 @@ class GirderBridge:
         items = list(self.gc.listItem(self.folder_id))
         if any(item['name'] == result_file_name for item in items):
             marker_name = f'completed_{safe_client_id}_{round_num}'
-            self._create_marker_item(marker_name)
+            self.create_marker_item(marker_name)
 
     def wait_for_clients_complete(
             self, round_num: int, total_clients: int, timeout=300.0, poll_interval=2.0
@@ -115,7 +118,7 @@ class GirderBridge:
         completed_count = 0
 
         while (completed_count < total_clients) and (time.time() < deadline):
-            items = self._get_current_items()
+            items = self.get_current_items()
 
             completed_count = 0
             for item in items:
@@ -130,7 +133,7 @@ class GirderBridge:
 
     def read_all_results(self, round_num: int) -> list:
         """Hub reads results from all clients."""
-        items = self._get_current_items()
+        items = self.get_current_items()
         results = []
         seen = set()
         for item in items:
@@ -156,10 +159,10 @@ class GirderBridge:
     def write_notification(self, msg_type: str):
         """Sends a stop signal or similar control message."""
         marker_name = f'notification_{msg_type}'
-        self._create_marker_item(marker_name)
+        self.create_marker_item(marker_name)
 
     def read_notifications(self) -> list:
-        items = self._get_current_items()
+        items = self.get_current_items()
         if any('notification_STOP' in item['name'] for item in items):
             return [True]
         return []

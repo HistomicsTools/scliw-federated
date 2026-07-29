@@ -105,55 +105,50 @@ class FederatedCardioClient:
         import torch.nn as nn
 
         current_round = 0
-        total_epochs = 100
+        # absurd number; we should get a done signal before hand
+        total_epochs = 100000
         print(f'[CLIENT] Starting loop for client ID {self.client_id}.')
-
         while current_round < total_epochs:
             marker_name = f'task_{current_round}_ready'
+            done_marker = 'task_done'
             print(f'[CLIENT] Waiting for Hub broadcast {marker_name}')
             ready = self.girder_bridge.wait_for_task_ready(
-                round_num=current_round,
+                marker=marker_name,
+                done_marker=done_marker,
                 timeout=3600.0,
                 poll_interval=2.0
             )
+            if ready == done_marker:
+                print('[CLIENT] Done signal received.')
+                break
             if not ready:
                 print(f'[CLIENT] Timeout waiting for epoch {current_round}')
                 continue
-
             global_weights = self.girder_bridge.read_task(current_round)
-
             if global_weights is None:
                 print(f'[CLIENT] No model weights found for epoch {current_round}.')
                 continue
-
             self.global_weights = global_weights
-
             X_local, y_local = self.load_data()
-
             device = torch.device('cpu')
             model = CardioNN(input_size=X_local.shape[1]).to(device)
             model.load_state_dict(global_weights)
-
             train_loader = torch.utils.data.DataLoader(
                 torch.utils.data.TensorDataset(X_local, y_local),
                 batch_size=32, shuffle=True
             )
             criterion = nn.CrossEntropyLoss()
             optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
-
             model.train()
             for _epoch in range(3):  # Simulate 3 local epochs
                 for X_batch, y_batch in train_loader:
                     X_batch = X_batch.to(device)
                     y_batch = y_batch.to(device)
-
                     optimizer.zero_grad()
                     loss = criterion(model(X_batch), y_batch)
                     loss.backward()
                     optimizer.step()
-
             updated_weights = model.state_dict()
-
             print(f'[CLIENT] Uploading result for round {current_round}')
             # Note: Girder transport handles file serialization directly,
             # standard NVFlare Shareables are not needed over the custom bridge.
@@ -162,7 +157,6 @@ class FederatedCardioClient:
                 round_num=current_round,
                 payload=updated_weights
             )
-
             current_round += 1
 
 
