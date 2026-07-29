@@ -157,10 +157,8 @@ class FederatedCardioClient:
             updated_weights = model.state_dict()
 
             print(f'[CLIENT] Uploading result for round {current_round}')
-            update_share = Shareable()
-            # Use a standard key; NVFlare's aggregator will handle it via AGG_INDEX or list order
-            update_share['WEIGHTS'] = updated_weights
-
+            # Note: Girder transport handles file serialization directly,
+            # standard NVFlare Shareables are not needed over the custom bridge.
             self.girder_bridge.write_result(
                 client_id=self.client_id,
                 round_num=current_round,

@@ -70,7 +70,10 @@ class GirderBridge:
                 pickle.dump(payload, f)
 
         self.gc.uploadFileToFolder(self.folder_id, source_path, task_file_name)
-        self._create_marker_item(marker_name)
+        # Verify the file is actually visible in Girder before signaling readiness
+        items = list(self.gc.listItem(self.folder_id))
+        if any(item['name'] == task_file_name for item in items):
+            self._create_marker_item(marker_name)
 
     def wait_for_task_ready(self, round_num: int, timeout=300.0, poll_interval=2.0) -> bool:
         """Clients poll until the Hub has uploaded the task for a specific round."""
@@ -107,8 +110,11 @@ class GirderBridge:
             torch.save(payload, dest_path)
 
         self.gc.uploadFileToFolder(self.folder_id, dest_path, result_file_name)
-        marker_name = f'completed_{safe_client_id}_{round_num}'
-        self._create_marker_item(marker_name)
+        # Verify the file is actually visible in Girder before signaling completion
+        items = list(self.gc.listItem(self.folder_id))
+        if any(item['name'] == result_file_name for item in items):
+            marker_name = f'completed_{safe_client_id}_{round_num}'
+            self._create_marker_item(marker_name)
 
     def wait_for_clients_complete(
             self, round_num: int, total_clients: int, timeout=300.0, poll_interval=2.0
@@ -152,9 +158,11 @@ class GirderBridge:
                 files = list(self.gc.listFile(item['_id'], limit=1))
                 if files:
                     self.gc.downloadFile(files[0]['_id'], dest_path)
-                    import torch as torch_module
-                    results.append(torch_module.load(dest_path, map_location='cpu'))
-                    print(f'read {name}')
+                    loaded_data = torch_module.load(dest_path, map_location='cpu')
+                    # Guard against async replication returning empty/corrupted files
+                    if loaded_data is not None:
+                        results.append(loaded_data)
+                        print(f'read {name}')
         return results
 
     def write_notification(self, msg_type: str):

@@ -73,8 +73,6 @@ class HubCoordinator:
         self.girder_bridge.write_task(round_num=0, payload=initial_weights)
         for epoch in range(self.epochs):
             print(f'Coordinating Epoch {epoch + 1}/{self.epochs}')
-            # Create trigger marker item via the bridge's synchronous poll mechanism
-            self.girder_bridge._create_marker_item(f'trigger_{int(epoch)}')
             print(f'[HUB] Waiting for {self.num_clients} workers to complete round {epoch + 1}')
             # Wait for clients via Girder Bridge protocol with explicit HTTP polling
             completed = self.girder_bridge.wait_for_clients_complete(
@@ -89,12 +87,14 @@ class HubCoordinator:
             client_raw_weights = self.girder_bridge.read_all_results(epoch)
             if not client_raw_weights:
                 raise RuntimeError(f'No client weights found in folder for epoch {epoch}')
+            from nvflare.apis.dxo import DXOMimeTypes
             fl_ctx = FLContext()
             can_aggregate = False
             # Accept each client's shareable into the NVFlare aggregator state sequentially
             for idx, w_dict in enumerate(client_raw_weights):
                 share = Shareable()
                 share['WEIGHTS'] = w_dict
+                share.set_content_type(DXOMimeTypes.DXO)  # Explicitly set DXO content type to prevent validation error
                 can_agg = self.nvflare_aggregator.accept(shareable=share, fl_ctx=fl_ctx)
                 print(idx, can_agg)  # DEBUG - remove me once working
                 if can_agg:
