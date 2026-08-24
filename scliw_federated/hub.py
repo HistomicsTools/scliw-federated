@@ -141,7 +141,8 @@ if __name__ == '__main__':
         try:
             workspace = gc.get('resource/lookup', parameters={'path': args.work_path})
             if workspace:
-                if sum(1 for _ in gc.listItem(workspace['_id'], limit=1)):
+                if 'parentId' in workspace and sum(
+                        1 for _ in gc.listItem(workspace['_id'], limit=1)):
                     ts = None
                     dt_obj = datetime.datetime.now(datetime.timezone.utc)
                     try:
@@ -154,7 +155,6 @@ if __name__ == '__main__':
                     formatted_dt = dt_obj.strftime('%Y%m%d-%H%M%S')
                     new_name = f'{workspace["name"]} {formatted_dt}'
                     gc.put(f'folder/{workspace["_id"]}', {'name': new_name})
-                if 'parentId' in workspace:
                     new_folder = gc.createFolder(
                         parentId=workspace['parentId'],
                         name=workspace['name'],
